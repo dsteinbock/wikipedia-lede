@@ -113,7 +113,8 @@ def get_all_revision_ids(article_title):
         'rvprop': 'timestamp|ids',
         'rvlimit': 'max',
         'format': 'json',
-        'rvdir': 'newer'
+        'rvdir': 'newer',
+        'maxlag': '5'  # Required for non-interactive tasks per API:Etiquette
     }
 
     print(f"Fetching complete revision history for '{article_title}'...")
@@ -166,7 +167,8 @@ def get_first_sentence_from_revision(revid, retry_count=0):
         'prop': 'text',
         'section': 0,
         'format': 'json',
-        'disabletoc': 1
+        'disabletoc': 1,
+        'maxlag': '5'  # Required for non-interactive tasks per API:Etiquette
     }
 
     response = requests.get(base_url, params=params, headers=headers)
@@ -189,6 +191,17 @@ def get_first_sentence_from_revision(revid, retry_count=0):
         data = response.json()
     except json.JSONDecodeError:
         return None
+
+    # Handle maxlag error - Wikipedia is too busy
+    if 'error' in data and data['error'].get('code') == 'maxlag':
+        if retry_count < 3:
+            wait_time = (2 ** retry_count) * 5  # 5s, 10s, 20s
+            print(f"  Server busy (maxlag), waiting {wait_time}s before retry...")
+            time.sleep(wait_time)
+            return get_first_sentence_from_revision(revid, retry_count + 1)
+        else:
+            print(f"  Server too busy after {retry_count} retries for revision {revid}")
+            return None
 
     if 'parse' not in data or 'text' not in data['parse']:
         return None
@@ -288,7 +301,7 @@ def analyze_with_cache(article_title, cache_file, test_mode=False, test_sample_r
     # Fetch new revisions
     if new_revids:
         print(f"\nFetching {len(new_revids)} new revisions...")
-        print(f"Estimated time: ~{len(new_revids) * 0.5 / 60:.1f} minutes")
+        print(f"Estimated time: ~{len(new_revids) * 0.1 / 60:.1f} minutes")
         new_revids_list = sorted([int(r) for r in new_revids])
 
         for i, revid in enumerate(new_revids_list):
@@ -318,8 +331,8 @@ def analyze_with_cache(article_title, cache_file, test_mode=False, test_sample_r
                 'sentence': sentence
             }
 
-            # Rate limiting - be more conservative
-            time.sleep(0.5)
+            # Rate limiting - 10 req/sec is reasonable with maxlag protection
+            time.sleep(0.1)
 
         print(f"  Completed analysis of {len(new_revids_list)} new revisions")
     else:
@@ -465,7 +478,7 @@ if __name__ == "__main__":
     elif full_mode:
         print("="*80)
         print("RUNNING IN FULL MODE - analyzing all revisions")
-        print("This will take approximately 40-50 minutes")
+        print("This will take approximately 8-10 minutes")
         print("="*80)
         analyze_with_cache(article_title, cache_file, test_mode=False)
     else:
