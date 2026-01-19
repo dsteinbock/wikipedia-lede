@@ -24,23 +24,29 @@ pip install requests
 
 ## Usage
 
-Run the script:
+The script has three modes:
+
+### Test Mode (Default)
+Analyzes every 100th revision for quick testing (~30 seconds):
 ```bash
 python wikipedia_first_sentence_analyzer.py
+# or explicitly:
+python wikipedia_first_sentence_analyzer.py --test
 ```
 
-By default, it analyzes the "27 Club" article. To analyze a different article, edit the last line of the script:
+### Full Mode
+Analyzes all ~5,000 revisions (~40 minutes):
+```bash
+python wikipedia_first_sentence_analyzer.py --full
+```
+
+### Caching
+The script caches all analyzed revisions. Subsequent runs only fetch new revisions since the last run, making updates very fast.
+
+To analyze a different article, edit this line in the script:
 ```python
 article_title = "Your Article Title"
 ```
-
-### Configuration
-
-You can adjust the sampling rate in the script:
-- Lower sample_rate (e.g., 10) = more detailed analysis, more API calls
-- Higher sample_rate (e.g., 50) = faster analysis, fewer API calls
-
-Default is 25, which samples every 25th revision.
 
 ## Output
 
@@ -49,14 +55,28 @@ The script generates two outputs:
 1. **Terminal output**: Top 10 most persistent first sentences with their active periods
 2. **JSON file**: Complete data for all unique sentences (`{Article_Name}_first_sentence_analysis.json`)
 
+## Features in Detail
+
+### Intelligent Sentence Extraction
+- Removes image captions and metadata from parsed HTML
+- Automatically finds the actual article text (starting with "The 27 Club")
+- Cleans HTML entities and formatting
+- Ensures consistent sentence beginnings
+
+### Smart Caching
+- Stores analyzed revisions in JSON
+- Only fetches new revisions on subsequent runs
+- Automatically migrates old cache formats
+- Checkpoint saves every 100 revisions
+
 ## API Respectfulness
 
 This script is designed to be respectful of Wikipedia's resources:
 - Uses lightweight queries to fetch revision metadata first
-- Only fetches content for sampled revisions
-- Includes 0.1s delay between API calls
+- Caches results to avoid re-fetching
+- Includes 0.5s delay between API calls with exponential backoff for rate limits
 - Uses proper User-Agent header
-- Samples ~4% of revisions by default
+- Test mode samples only 1% of revisions by default
 
 ## Example Output
 
