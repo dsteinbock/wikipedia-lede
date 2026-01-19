@@ -50,10 +50,25 @@ article_title = "Your Article Title"
 
 ## Output
 
-The script generates two outputs:
+The analyzer generates:
 
-1. **Terminal output**: Top 10 most persistent first sentences with their active periods
-2. **JSON file**: Complete data for all unique sentences (`{Article_Name}_first_sentence_analysis.json`)
+1. **Terminal output**: Top 15 most persistent first sentences with their active periods
+2. **JSON file**: Complete data with revision cache (`{Article_Name}_first_sentence_analysis.json`)
+
+### CSV Export
+
+Generate a chronological CSV of all sentences:
+```bash
+python generate_csv.py
+```
+
+This creates a CSV with columns:
+- `first_appearance` - Date the sentence first appeared
+- `total_days_active` - Total days active across all periods
+- `num_periods` - Number of separate periods it was active
+- `sentence` - Complete first sentence text
+
+The CSV is sorted chronologically, perfect for analyzing how the article evolved over time.
 
 ## Features in Detail
 
