@@ -195,9 +195,18 @@ def get_first_sentence_from_revision(revid, retry_count=0):
 
     html_content = data['parse']['text']['*']
 
+    # Remove image/file references and their captions first
+    html_content = re.sub(r'<div[^>]*class="[^"]*thumb[^"]*"[^>]*>.*?</div>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+
     # Extract plain text from HTML
     text = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Remove any remaining File: or Image: references
+    text = re.sub(r'File:[^\s]+\.(jpg|png|gif|jpeg|svg)[^.!?]*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'Image:[^\s]+\.(jpg|png|gif|jpeg|svg)[^.!?]*', '', text, flags=re.IGNORECASE)
+
+    # Strip HTML tags
     text = re.sub(r'<[^>]+>', '', text)
 
     # Decode HTML entities
@@ -212,6 +221,16 @@ def get_first_sentence_from_revision(revid, retry_count=0):
     # Clean up whitespace
     text = re.sub(r'\s+', ' ', text).strip()
 
+    # Remove any leading image captions or metadata
+    # Look for patterns like "Musicians and artists who died at age 27" followed by actual text
+    if not text.startswith('The 27 Club') and not text.startswith('the 27 Club'):
+        # Try to find where the actual article text starts
+        match = re.search(r'(The 27 Club[^.!?]*[.!?])', text, re.IGNORECASE)
+        if match:
+            # Start from "The 27 Club"
+            start_idx = match.start()
+            text = text[start_idx:]
+
     # Extract first sentence
     match = re.search(r'^(.*?[.!?])(?:\s|$)', text)
 
@@ -223,10 +242,16 @@ def get_first_sentence_from_revision(revid, retry_count=0):
     # Clean the sentence to start with "The 27 Club"
     return clean_sentence(sentence)
 
-def analyze_with_cache(article_title, cache_file):
+def analyze_with_cache(article_title, cache_file, test_mode=False, test_sample_rate=100):
     """
     Analyze article with caching support.
     Only fetches revisions that haven't been analyzed before.
+
+    Args:
+        article_title: Title of Wikipedia article
+        cache_file: Path to cache JSON file
+        test_mode: If True, only analyze every Nth revision for testing
+        test_sample_rate: Sample rate when in test mode (default: 100)
     """
     # Load existing cache
     cache = load_cache(cache_file)
@@ -243,10 +268,19 @@ def analyze_with_cache(article_title, cache_file):
 
     new_revids = all_revids - cached_revids
 
+    # Apply test mode sampling if enabled
+    if test_mode and len(new_revids) > test_sample_rate:
+        new_revids_sorted = sorted([int(r) for r in new_revids])
+        sampled_revids = [str(new_revids_sorted[i]) for i in range(0, len(new_revids_sorted), test_sample_rate)]
+        new_revids = set(sampled_revids)
+        print(f"\nTest mode enabled: sampling every {test_sample_rate}th revision")
+
     print(f"\nCache statistics:")
     print(f"  Total revisions: {len(all_revisions)}")
     print(f"  Already cached: {len(cached_revids)}")
     print(f"  New to analyze: {len(new_revids)}")
+    if test_mode:
+        print(f"  (Test mode: sampled from larger set)")
 
     # Create revision lookup
     revid_to_timestamp = {str(rev['revid']): rev['timestamp'] for rev in all_revisions}
@@ -414,7 +448,30 @@ def analyze_with_cache(article_title, cache_file):
     print("="*80)
 
 if __name__ == "__main__":
+    import sys
+
     article_title = "27 Club"
     cache_file = f"{article_title.replace(' ', '_')}_first_sentence_analysis.json"
 
-    analyze_with_cache(article_title, cache_file)
+    # Check for test mode flag
+    test_mode = '--test' in sys.argv or '-t' in sys.argv
+    full_mode = '--full' in sys.argv or '-f' in sys.argv
+
+    if test_mode:
+        print("="*80)
+        print("RUNNING IN TEST MODE - sampling every 100th revision")
+        print("="*80)
+        analyze_with_cache(article_title, cache_file, test_mode=True, test_sample_rate=100)
+    elif full_mode:
+        print("="*80)
+        print("RUNNING IN FULL MODE - analyzing all revisions")
+        print("This will take approximately 40-50 minutes")
+        print("="*80)
+        analyze_with_cache(article_title, cache_file, test_mode=False)
+    else:
+        # Default to test mode for safety
+        print("="*80)
+        print("DEFAULT MODE: Running in test mode")
+        print("Use --full to analyze all revisions, or --test to explicitly use test mode")
+        print("="*80)
+        analyze_with_cache(article_title, cache_file, test_mode=True, test_sample_rate=100)
