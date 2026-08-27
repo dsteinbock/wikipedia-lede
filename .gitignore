@@ -6,3 +6,10 @@ __pycache__/
 # Output files
 *.json
 *.csv
+!age-27-musicians/age_27_musicians.csv
+!age-27-musicians/age_27_club_members_2024-04-18.csv
+!age-27-people/age_27_people.csv
+
+# Reusable but untracked Wikidata query responses
+age-27-musicians/.cache/
+age-27-people/.cache/
