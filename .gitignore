@@ -2,6 +2,7 @@
 venv/
 __pycache__/
 *.pyc
+.DS_Store
 
 # Output files
 *.json
@@ -13,3 +14,4 @@ __pycache__/
 # Reusable but untracked Wikidata query responses
 age-27-musicians/.cache/
 age-27-people/.cache/
+age-27-musicians/27_Club-table-history/
