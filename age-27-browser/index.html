@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Explore people whose recorded lifespan intersects age 27.">
+  <title>27ish Club — an age 27 data atlas</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="masthead">
+    <a class="wordmark" href="#top" aria-label="27ish Club home">
+      <span class="wordmark-number">27</span>
+      <span class="wordmark-copy">27ish<br>Club</span>
+    </a>
+    <p class="masthead-note">A statistically awkward number of people who never had to worry about turning 30.</p>
+  </header>
+
+  <main id="top">
+    <section class="hero" aria-labelledby="page-title">
+      <div class="hero-copy">
+        <p class="eyebrow">Wikidata’s least cheerful birthday list</p>
+        <h1 id="page-title"><span>27ish</span><br><em>Club.</em></h1>
+        <p class="hero-deck">Explore <strong id="hero-count">2,956</strong> records of people who stopped updating early. History is long. Their twenties were, statistically speaking, a limited series.</p>
+      </div>
+      <div class="hero-orbit" aria-hidden="true">
+        <div class="orbit orbit-one"></div>
+        <div class="orbit orbit-two"></div>
+        <div class="hero-27">27</div>
+        <span class="orbit-label orbit-label-one">definitely 27</span>
+        <span class="orbit-label orbit-label-two">give or take</span>
+      </div>
+      <div class="hero-foot">
+        <span>too soon</span>
+        <span class="hero-line"></span>
+        <span>still too soon</span>
+      </div>
+    </section>
+
+    <section class="explorer" aria-labelledby="explorer-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">The dearly data-parted</p>
+          <h2 id="explorer-title">Everybody dies.<br>These people had timing.</h2>
+        </div>
+        <button class="reset-button" id="reset-filters" type="button">Reset filters</button>
+      </div>
+
+      <div class="filter-deck" aria-label="Dataset filters">
+        <div class="filter-field occupation-filter-shell">
+          <span>Occupation</span>
+          <button class="occupation-filter-button" id="occupation-filter-button" type="button" aria-expanded="false" aria-controls="occupation-filter-panel">
+            <span id="occupation-filter-summary">All occupations</span><i>+</i>
+          </button>
+          <div class="occupation-filter-panel" id="occupation-filter-panel" hidden>
+            <div class="occupation-panel-heading">
+              <div><strong>Choose who remains visible</strong><span>Selections combine with “or”</span></div>
+              <div><button type="button" id="occupation-select-all">Select all</button><button type="button" id="occupation-select-none">Select none</button></div>
+            </div>
+            <div class="occupation-groups" id="occupation-groups"></div>
+          </div>
+        </div>
+        <label class="filter-field">
+          <span>Era of death</span>
+          <div class="year-fields">
+            <label><small>From</small><input id="year-min" type="number" value="-1771" inputmode="numeric" aria-label="Minimum death year"></label>
+            <span>—</span>
+            <label><small>To</small><input id="year-max" type="number" value="2026" inputmode="numeric" aria-label="Maximum death year"></label>
+          </div>
+        </label>
+        <label class="filter-field">
+          <span>Classification</span>
+          <select id="status-filter">
+            <option value="all">Confirmed + possible</option>
+            <option value="confirmed">Confirmed only</option>
+            <option value="possible">Possible only</option>
+          </select>
+        </label>
+        <label class="filter-field filter-search">
+          <span>Search</span>
+          <input id="search" type="search" placeholder="Name, identity, cause, manner or QID…" autocomplete="off">
+        </label>
+      </div>
+
+      <div class="result-ribbon" aria-live="polite">
+        <span class="result-number" id="result-count">2,956</span>
+        <span class="result-label">matching lives</span>
+        <span class="result-context" id="result-context">All people · all eras</span>
+      </div>
+
+      <div class="timeline-stage">
+        <article class="viz-panel timeline-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">The main event, chronologically</p>
+              <h3>The point of no return</h3>
+            </div>
+            <p id="timeline-note">Each dot is one person, placed at their exact recorded year of death</p>
+          </div>
+          <div class="zoom-control" aria-label="Timeline zoom control">
+            <div class="zoom-heading">
+              <span>Zoom the mortality window</span>
+              <output id="zoom-readout">1771 BCE — 2026</output>
+              <span id="zoom-count">2,956 points in view</span>
+            </div>
+            <div class="zoom-rail">
+              <div class="zoom-track"></div>
+              <div class="zoom-selection" id="zoom-selection"></div>
+              <input id="zoom-start" type="range" aria-label="Timeline start year">
+              <input id="zoom-end" type="range" aria-label="Timeline end year">
+            </div>
+            <div class="zoom-extents"><span>1771 BCE</span><span>Full historical scale stays put</span><span>2026</span></div>
+          </div>
+          <fieldset class="cloud-mode">
+            <legend>Vertical arrangement</legend>
+            <label><input type="radio" name="cloud-mode" value="drift" checked><span>Free drift</span></label>
+            <label><input type="radio" name="cloud-mode" value="occupation"><span>Occupation bands</span></label>
+            <p id="cloud-mode-note">Vertical position is random, deterministic, and professionally meaningless.</p>
+          </fieldset>
+          <div class="timeline-wrap">
+            <svg id="timeline" role="img" aria-label="Point cloud of people by year of death and occupation"></svg>
+            <div class="chart-tooltip" id="timeline-tooltip" role="tooltip"></div>
+          </div>
+          <div class="timeline-legend" id="timeline-legend" aria-label="Leading occupation colors"></div>
+        </article>
+      </div>
+
+      <div class="support-grid">
+        <article class="viz-panel status-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Cause of classification</p>
+              <h3>Dead certain-ish</h3>
+            </div>
+          </div>
+          <div class="donut-layout">
+            <div class="donut" id="status-donut" role="img" aria-label="Classification breakdown">
+              <div class="donut-core"><strong id="confirmed-pct">52%</strong><span>confirmed</span></div>
+            </div>
+            <dl class="status-legend">
+              <div><dt><i class="legend-dot confirmed-dot"></i>Confirmed</dt><dd id="confirmed-count">1,549</dd></div>
+              <div><dt><i class="legend-dot possible-dot"></i>Possible</dt><dd id="possible-count">1,407</dd></div>
+            </dl>
+          </div>
+        </article>
+
+        <article class="viz-panel occupations-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Before the abrupt career break</p>
+              <h3>Leading occupations</h3>
+            </div>
+            <p>Click a bar to filter</p>
+          </div>
+          <div class="occupation-bars" id="occupation-bars"></div>
+        </article>
+      </div>
+
+      <section class="record-section" aria-labelledby="records-title">
+        <div class="record-heading">
+          <div>
+            <p class="eyebrow">Roll call for the permanently unavailable</p>
+            <h2 id="records-title">The guest list</h2>
+          </div>
+          <label class="sort-field">Sort
+            <select id="sort-order">
+              <option value="death-asc">Death date: oldest first</option>
+              <option value="death-desc">Death date: newest first</option>
+              <option value="name">Name: A–Z</option>
+              <option value="certainty">Certainty</option>
+            </select>
+          </label>
+        </div>
+        <div class="record-list" id="record-list"></div>
+        <div class="empty-state" id="empty-state" hidden>
+          <strong>No dearly departed match that combination.</strong>
+          <button type="button" id="empty-reset">Clear the filters</button>
+        </div>
+        <div class="scroll-sentinel" id="scroll-sentinel" aria-live="polite"><span>More names materialize as you descend</span></div>
+      </section>
+    </section>
+  </main>
+
+  <dialog class="detail-dialog" id="detail-dialog">
+    <button class="dialog-close" id="dialog-close" type="button" aria-label="Close record">×</button>
+    <div id="dialog-content"></div>
+  </dialog>
+
+  <footer>
+    <div class="footer-27">27</div>
+    <p>Dates are structured. Mortality remains stubbornly unstructured. “Possible” reflects fuzzy source dates, not a séance with the editorial board.</p>
+    <a href="#top">Back to top ↑</a>
+  </footer>
+
+  <script src="data.js"></script>
+  <script src="app.js?v=11"></script>
+</body>
+</html>
