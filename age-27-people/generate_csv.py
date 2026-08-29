@@ -42,6 +42,8 @@ WIKIPEDIA_FALLBACK_COLUMNS = [
     "wikipedia_death_review_status",
 ]
 CSV_COLUMNS = CSV_BASE_COLUMNS + ["occupations"] + WIKIPEDIA_FALLBACK_COLUMNS
+REMOVED_ENTRY_METADATA_COLUMNS = ["removal_reason", "removed_utc", "source_run_dir"]
+REMOVED_ENTRY_COLUMNS = CSV_COLUMNS + REMOVED_ENTRY_METADATA_COLUMNS
 DEATH_REVIEW_STATUSES = {
     "",
     "settled",
@@ -330,6 +332,39 @@ def load_wikipedia_fallbacks(output: Path) -> dict[str, dict[str, str]]:
         }
 
 
+def load_removed_qids(path: Path) -> set[str]:
+    """Load the permanent exclusion ledger used by future crawls."""
+
+    if not path.exists():
+        return set()
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames != REMOVED_ENTRY_COLUMNS:
+            raise DataValidationError("Removed-entry ledger schema mismatch")
+        qids: set[str] = set()
+        for row in reader:
+            qid = str(row.get("wikidata_id", "")).strip()
+            if not re.fullmatch(r"Q[1-9][0-9]*", qid):
+                raise DataValidationError(f"Invalid removed-entry QID: {qid}")
+            if qid in qids:
+                raise DataValidationError(f"Duplicate removed-entry QID: {qid}")
+            if not str(row.get("removal_reason", "")).strip():
+                raise DataValidationError(f"Removed entry has no reason: {qid}")
+            if not str(row.get("removed_utc", "")).strip():
+                raise DataValidationError(f"Removed entry has no timestamp: {qid}")
+            if not str(row.get("source_run_dir", "")).strip():
+                raise DataValidationError(f"Removed entry has no source run: {qid}")
+            qids.add(qid)
+        return qids
+
+
+def exclude_removed_rows(
+    rows: Sequence[dict[str, str | int]], removed_qids: set[str]
+) -> tuple[list[dict[str, str | int]], int]:
+    kept = [row for row in rows if str(row["wikidata_id"]) not in removed_qids]
+    return kept, len(rows) - len(kept)
+
+
 def apply_wikipedia_fallbacks(
     rows: Sequence[dict[str, str | int]],
     fallbacks: Mapping[str, Mapping[str, str]],
@@ -394,18 +429,31 @@ def write_csv(rows: Sequence[Mapping[str, object]], output: Path) -> None:
         writer.writerows(rows)
 
 
-def generate(output: Path, cache_dir: Path) -> tuple[list[dict[str, str | int]], CrawlStats]:
+def generate(
+    output: Path,
+    cache_dir: Path,
+    removed_entries: Path | None = None,
+) -> tuple[list[dict[str, str | int]], CrawlStats]:
     fallbacks = load_wikipedia_fallbacks(output)
+    removed_entries = removed_entries or output.parent / "removed_entries.csv"
+    removed_qids = load_removed_qids(removed_entries)
     wdqs = WDQSClient(cache_dir / "wdqs", user_agent=USER_AGENT)
     people = discover_people(wdqs)
+    candidate_count = len(people)
+    if removed_qids:
+        # Do not spend GraphQL enrichment requests on permanently excluded QIDs.
+        people = {qid: person for qid, person in people.items() if qid not in removed_qids}
     graphql = GraphQLClient(cache_dir / "graphql", user_agent=USER_AGENT)
     labels = enrich_people(graphql, people)
     rows, exclusions = build_rows(people, labels)
+    rows, removed_count = exclude_removed_rows(rows, removed_qids)
+    if removed_count:
+        exclusions["removed_entries"] += removed_count
     apply_wikipedia_fallbacks(rows, fallbacks)
     validate_rows(rows)
     write_csv(rows, output)
     stats = CrawlStats(
-        candidate_count=len(people),
+        candidate_count=candidate_count,
         included_count=len(rows),
         confirmed_count=sum(row["age_status"] == "confirmed" for row in rows),
         possible_count=sum(row["age_status"] == "possible" for row in rows),
@@ -418,13 +466,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     project_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=project_dir / "age_27_people.csv")
+    parser.add_argument(
+        "--removed-entries", type=Path, default=project_dir / "removed_entries.csv"
+    )
     parser.add_argument("--cache-dir", type=Path, default=project_dir / ".cache", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    _, stats = generate(args.output, args.cache_dir)
+    _, stats = generate(args.output, args.cache_dir, args.removed_entries)
     print(f"Candidates discovered: {stats.candidate_count}")
     print(f"Wrote {stats.included_count} rows to {args.output}")
     print(f"Confirmed: {stats.confirmed_count}; possible: {stats.possible_count}")

@@ -1,0 +1,307 @@
+{
+  "schema_version": 1,
+  "mappings": {
+    "cause": {
+      "airstrike": {
+        "label": "airstrike",
+        "qid": "Q2380335"
+      },
+      "asthma": {
+        "label": "asthma",
+        "qid": "Q35869"
+      },
+      "aviation accident": {
+        "label": "aviation accident",
+        "qid": "Q744913"
+      },
+      "bacterial infection": {
+        "label": "bacterial infection",
+        "qid": "Q804503"
+      },
+      "blast injury": {
+        "label": "blast injury",
+        "qid": "Q3048989"
+      },
+      "blunt trauma": {
+        "label": "blunt trauma",
+        "qid": "Q770709"
+      },
+      "cancer": {
+        "label": "cancer",
+        "qid": "Q12078"
+      },
+      "car bomb": {
+        "label": "car bomb",
+        "qid": "Q11244"
+      },
+      "cardiac arrest": {
+        "label": "cardiac arrest",
+        "qid": "Q202837"
+      },
+      "cardiomyopathy": {
+        "label": "cardiomyopathy",
+        "qid": "Q1364270"
+      },
+      "complications of pregnancy": {
+        "label": "complications of pregnancy",
+        "qid": "Q2916477"
+      },
+      "death in battle": {
+        "label": "death in battle",
+        "qid": "Q18663901"
+      },
+      "decapitation": {
+        "label": "decapitation",
+        "qid": "Q204933"
+      },
+      "drowning": {
+        "label": "drowning",
+        "qid": "Q506616"
+      },
+      "drug overdose": {
+        "label": "drug overdose",
+        "qid": "Q3505252"
+      },
+      "execution": {
+        "label": "execution",
+        "qid": "Q8454"
+      },
+      "explosion": {
+        "label": "explosion",
+        "qid": "Q855121"
+      },
+      "explosive device": {
+        "label": "explosive device",
+        "qid": "Q2429767"
+      },
+      "gunshot wound": {
+        "label": "gunshot wound",
+        "qid": "Q2140674"
+      },
+      "homicide": {
+        "label": "homicide",
+        "qid": "Q149086"
+      },
+      "injury": {
+        "label": "injury",
+        "qid": "Q106064"
+      },
+      "myocardial infarction": {
+        "label": "myocardial infarction",
+        "qid": "Q12152"
+      },
+      "pneumonia": {
+        "label": "pneumonia",
+        "qid": "Q12192"
+      },
+      "rhabdomyosarcoma": {
+        "label": "rhabdomyosarcoma",
+        "qid": "Q1898141"
+      },
+      "ruptured aortic aneurysm": {
+        "label": "ruptured aortic aneurysm",
+        "qid": "Q55072931"
+      },
+      "self-immolation": {
+        "label": "self-immolation",
+        "qid": "Q621076"
+      },
+      "sepsis": {
+        "label": "sepsis",
+        "qid": "Q601461"
+      },
+      "stab wound": {
+        "label": "stab wound",
+        "qid": "Q4228595"
+      },
+      "suicide": {
+        "label": "suicide",
+        "qid": "Q10737"
+      },
+      "suicide attack": {
+        "label": "suicide attack",
+        "qid": "Q217327"
+      },
+      "traffic collision": {
+        "label": "traffic collision",
+        "qid": "Q9687"
+      },
+      "traumatic brain injury": {
+        "label": "traumatic brain injury",
+        "qid": "Q1995526"
+      },
+      "heart condition": {
+        "label": "hypertrophic cardiomyopathy",
+        "qid": "Q1364270"
+      },
+      "heart-related condition": {
+        "label": "myocardial infarction",
+        "qid": "Q12152"
+      },
+      "respiratory failure": {
+        "label": "respiratory failure",
+        "qid": "Q767485"
+      },
+      "stroke": {
+        "label": "stroke",
+        "qid": "Q12202"
+      }
+    },
+    "manner": {
+      "accidental death": {
+        "label": "accidental death",
+        "qid": "Q21142718"
+      },
+      "capital punishment": {
+        "label": "capital punishment",
+        "qid": "Q229871"
+      },
+      "death in battle": {
+        "label": "death in battle",
+        "qid": "Q18663901"
+      },
+      "death in custody": {
+        "label": "death in custody",
+        "qid": "Q25476356"
+      },
+      "homicide": {
+        "label": "homicide",
+        "qid": "Q149086"
+      },
+      "natural causes": {
+        "label": "natural causes",
+        "qid": "Q3739104"
+      },
+      "suicide": {
+        "label": "suicide",
+        "qid": "Q10737"
+      }
+    },
+    "occupation": {
+      "activist": {
+        "label": "activist",
+        "qid": "Q15253558"
+      },
+      "aristocrat": {
+        "label": "aristocrat",
+        "qid": "Q2478141"
+      },
+      "ceramicist": {
+        "label": "ceramicist",
+        "qid": "Q7541856"
+      },
+      "comedian": {
+        "label": "Comedian",
+        "qid": "Q245068"
+      },
+      "conservationist": {
+        "label": "conservationist",
+        "qid": "Q16060693"
+      },
+      "gangster": {
+        "label": "gangster",
+        "qid": "Q46961"
+      },
+      "gunsmith": {
+        "label": "gunsmith",
+        "qid": "Q1371796"
+      },
+      "homicide victim": {
+        "label": "homicide victim",
+        "qid": "Q108295395"
+      },
+      "mass murderer": {
+        "label": "mass murderer",
+        "qid": "Q15883433"
+      },
+      "militant": {
+        "label": "militant",
+        "qid": "Q17010072"
+      },
+      "military officer": {
+        "label": "military officer",
+        "qid": "Q189290"
+      },
+      "motocross rider": {
+        "label": "motocross rider",
+        "qid": "Q12327806"
+      },
+      "murder victim": {
+        "label": "murder victim",
+        "qid": "Q73153647"
+      },
+      "murderer": {
+        "label": "murderer",
+        "qid": "Q931260"
+      },
+      "musician": {
+        "label": "musician",
+        "qid": "Q639669"
+      },
+      "naval officer": {
+        "label": "naval officer",
+        "qid": "Q10669499"
+      },
+      "political activist": {
+        "label": "political activist",
+        "qid": "Q11499147"
+      },
+      "politician": {
+        "label": "politician",
+        "qid": "Q82955"
+      },
+      "programmer": {
+        "label": "programmer",
+        "qid": "Q5482740"
+      },
+      "record holder": {
+        "label": "record holder",
+        "qid": "Q115705912"
+      },
+      "serial killer": {
+        "label": "serial killer",
+        "qid": "Q484188"
+      },
+      "soldier": {
+        "label": "soldier",
+        "qid": "Q4991371"
+      },
+      "street protester": {
+        "label": "street protester",
+        "qid": "Q7623053"
+      },
+      "student": {
+        "label": "student",
+        "qid": "Q48282"
+      },
+      "teacher": {
+        "label": "teacher",
+        "qid": "Q37226"
+      },
+      "terrorist": {
+        "label": "terrorist",
+        "qid": "Q14886050"
+      },
+      "entrepreneur": {
+        "label": "entrepreneur",
+        "qid": "Q131524"
+      },
+      "freestyle motocross rider": {
+        "label": "freestyle motocross rider",
+        "qid": "Q67020237"
+      },
+      "indian army officer": {
+        "label": "military officer",
+        "qid": "Q189290"
+      },
+      "islamic state leader": {
+        "label": "Leader of the Islamic State",
+        "qid": "Q57360796"
+      },
+      "jazz trumpeter": {
+        "label": "jazz trumpeter",
+        "qid": "Q61947786"
+      }
+    }
+  }
+}

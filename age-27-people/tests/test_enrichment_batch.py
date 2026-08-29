@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import importlib.util
 import json
 import tempfile
@@ -76,6 +77,27 @@ def primary_eligible(reason="The English article is a dedicated biography."):
     }
 
 
+def semantic_page_review(**overrides):
+    value = {
+        "page_kind": "person",
+        "subject_match": "match",
+        "subject_is_human": "human",
+        "life_status": "deceased",
+        "age_compatibility": "compatible",
+        "reason": "The packet is a dedicated biography of the deceased subject.",
+    }
+    value.update(overrides)
+    return value
+
+
+def install_artifact(run_dir, role, qid, value):
+    source = run_dir / "worker-output" / role / f"{qid}.json"
+    batch.atomic_write_json(source, value)
+    return batch.record_semantic_artifact(
+        cohort_value=run_dir, role=role, qid=qid, input_path=source
+    )
+
+
 def write_article_and_packet(cache, run_dir, qid, name, raw):
     article = {
         "wikidata_id": qid,
@@ -132,6 +154,33 @@ class SelectionTests(unittest.TestCase):
             [row["wikidata_id"] for row in selected],
             ["Q50", "Q10", "Q20", "Q30"],
         )
+
+    def test_selection_excludes_removed_entries_and_manifest_allows_them_missing(self):
+        removed = blank_row("Q20", "Removed", "2024")
+        remaining = blank_row("Q10", "Remaining", "2023")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            ledger = root / "removed_entries.csv"
+            write_csv(people, TEST_COLUMNS, [removed, remaining])
+            ledger_row = {
+                **removed,
+                "removal_reason": "living",
+                "removed_utc": batch.utc_now(),
+                "source_run_dir": str(root / "run"),
+            }
+            write_csv(ledger, batch.removed_entry_columns(TEST_COLUMNS), [ledger_row])
+            _, count = batch.select_eligible(
+                [removed, remaining], 10, removed_qids={"Q20"}
+            )
+            self.assertEqual(count, 1)
+            status = batch.eligibility_status(
+                people,
+                limit=10,
+                target_manifest=None,
+                removed_csv=ledger,
+            )
+            self.assertEqual(status["eligible_count"], 1)
 
     def test_status_is_read_only_and_reports_total(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -266,6 +315,7 @@ class RetrievalAndPacketTests(unittest.TestCase):
             for key in (
                 "lead_sentence",
                 "rest_of_lead_paragraph",
+                "remaining_lead_section",
                 "infobox",
                 "rest_of_article",
             )
@@ -274,16 +324,11 @@ class RetrievalAndPacketTests(unittest.TestCase):
         self.assertIn("The death was accidental", combined)
         self.assertIn("painter", packet["infobox"])
         self.assertIn(marker, packet["rest_of_article"])
-        self.assertEqual(packet["schema_version"], 2)
+        self.assertEqual(packet["schema_version"], 3)
+        self.assertEqual(packet["remaining_lead_section"], "A second lead paragraph.")
         self.assertEqual(packet["article_sections"][0]["heading"], "Death")
         self.assertIn("motorcycle", packet["article_sections"][0]["text"])
-        self.assertTrue(packet["death_evidence_candidates"])
-        self.assertTrue(
-            any(
-                "motorcycle" in candidate["excerpt"]
-                for candidate in packet["death_evidence_candidates"]
-            )
-        )
+        self.assertNotIn("death_evidence_candidates", packet)
 
     def test_fetch_uses_bulk_redirect_options_and_qid_cache(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -347,7 +392,14 @@ class RetrievalAndPacketTests(unittest.TestCase):
             proposals = root / "proposals.jsonl"
             proposals.write_text("", encoding="utf-8")
             batch.atomic_write_json(
-                root / "unresolved_vocabulary.json", ["gunshot wound"]
+                root / "unresolved_vocabulary.json",
+                [
+                    {
+                        "field": "cause",
+                        "label": "gunshot wound",
+                        "normalized_label": "gunshot wound",
+                    }
+                ],
             )
             calls = []
             original = batch._api_json
@@ -383,9 +435,17 @@ class RetrievalAndPacketTests(unittest.TestCase):
             candidates = json.loads(
                 (root / "vocabulary_candidates.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(
-                candidates["labels"]["gunshot wound"][0]["id"], "Q2140674"
+            self.assertEqual(candidates["items"][0]["field"], "cause")
+            self.assertEqual(candidates["items"][0]["candidates"][0]["id"], "Q2140674")
+            assignment = json.loads(
+                batch.build_vocabulary_input(
+                    proposals_path=proposals,
+                    field="cause",
+                    label="gunshot wound",
+                ).read_text(encoding="utf-8")
             )
+            self.assertEqual(assignment["role"], "vocabulary")
+            self.assertEqual(assignment["label"], "gunshot wound")
 
 
 class StagingAndApplyTests(unittest.TestCase):
@@ -609,7 +669,7 @@ class StagingAndApplyTests(unittest.TestCase):
                 )
             self.assertEqual(people.read_bytes(), before)
 
-    def test_validation_rejects_unknown_without_every_candidate_disposition(self):
+    def test_semantic_classification_rejects_unknown_evidence_id(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             people = root / "people.csv"
@@ -625,7 +685,7 @@ class StagingAndApplyTests(unittest.TestCase):
                 batch_size=1,
                 run_dir=run_dir,
             )
-            packet = write_article_and_packet(
+            write_article_and_packet(
                 cache,
                 run_dir,
                 "Q1",
@@ -633,39 +693,156 @@ class StagingAndApplyTests(unittest.TestCase):
                 "'''Person''' was an actor.\n\n==Death==\n"
                 "Person died after an illness, but no manner was reported.",
             )
-            self.assertTrue(packet["death_evidence_candidates"])
-            proposals_path = batch.init_proposals(cohort_value=run_dir)
-            proposals = batch.load_proposals(proposals_path)
-            proposals[0].update(
+            batch.atomic_write_json(
+                run_dir / "semantic" / "death-evidence" / "Q1.json",
                 {
-                    "article_eligibility": primary_eligible(),
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "evidence": [
+                        {
+                            "evidence_id": "E1",
+                            "source_tier": "rest_of_article",
+                            "section": "Death",
+                            "text": "Person died after an illness.",
+                        }
+                    ],
+                    "no_usable_account": {"cause": False, "manner": True},
+                    "reason": "The article reports no manner of death.",
+                },
+            )
+            batch.atomic_write_json(
+                run_dir / "semantic" / "death-classification" / "Q1.json",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "cause": None,
                     "manner": [{"label": "somevalue", "qid": ""}],
                     "status": "unknown",
-                    "evidence_basis": {
-                        "cause": None,
-                        "manner": evidence(
-                            "none", "", "", "No manner is established."
-                        ),
-                        "occupation": None,
-                    },
-                    "unknown_review": {
-                        "cause": None,
-                        "manner": {
-                            "reviewed_source_tiers": batch.DEATH_REVIEW_TIERS,
-                            "candidate_dispositions": {},
-                            "conclusion": "No manner is established.",
-                        },
-                    },
-                }
+                    "evidence_ids": {"cause": [], "manner": ["E99"]},
+                    "reason": "No usable manner account exists.",
+                },
             )
-            batch.write_proposals(proposals_path, proposals)
-            with self.assertRaisesRegex(batch.BatchError, "candidate audit mismatch"):
-                batch.validate_proposals(
-                    cohort_value=run_dir,
-                    proposals_path=proposals_path,
-                    people_csv=people,
-                    cache_root=cache,
+            evidence_artifact = batch._validate_death_evidence(run_dir, "Q1")
+            with self.assertRaisesRegex(batch.BatchError, "unknown or duplicate"):
+                batch._validate_death_classification(
+                    run_dir,
+                    "Q1",
+                    {"cause": False, "manner": True, "occupation": False},
+                    evidence_artifact,
                 )
+
+    def test_semantic_classification_settles_any_usable_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            evidence_artifact = {
+                "schema_version": 1,
+                "wikidata_id": "Q1",
+                "evidence": [
+                    {
+                        "evidence_id": "E1",
+                        "source_tier": "rest_of_article",
+                        "section": "Death",
+                        "text": "It was reported that the person died by suicide.",
+                    }
+                ],
+                "no_usable_account": {"cause": True, "manner": False},
+                "reason": "The article reports a manner but no physical mechanism.",
+            }
+            batch.atomic_write_json(
+                run_dir / "semantic" / "death-classification" / "Q1.json",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "cause": [{"label": "somevalue", "qid": ""}],
+                    "manner": [{"label": "suicide", "qid": ""}],
+                    "status": "settled",
+                    "evidence_ids": {"cause": [], "manner": ["E1"]},
+                    "reason": "Any reported account is settled under project policy.",
+                },
+            )
+            parsed = batch._validate_death_classification(
+                run_dir,
+                "Q1",
+                {"cause": True, "manner": True, "occupation": False},
+                evidence_artifact,
+            )
+            self.assertEqual(parsed["status"], "settled")
+
+    def test_semantic_classification_rejects_provisional(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            evidence_artifact = {
+                "schema_version": 1,
+                "wikidata_id": "Q1",
+                "evidence": [
+                    {
+                        "evidence_id": "E1",
+                        "source_tier": "rest_of_article",
+                        "section": "Death",
+                        "text": "A possible heart attack was reported.",
+                    }
+                ],
+                "no_usable_account": {"cause": False, "manner": False},
+                "reason": "The article offers a possible account.",
+            }
+            batch.atomic_write_json(
+                run_dir / "semantic" / "death-classification" / "Q1.json",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "cause": [{"label": "myocardial infarction", "qid": ""}],
+                    "manner": [{"label": "natural causes", "qid": ""}],
+                    "status": "provisional",
+                    "evidence_ids": {"cause": ["E1"], "manner": ["E1"]},
+                    "reason": "The account was described as possible.",
+                },
+            )
+            with self.assertRaisesRegex(
+                batch.BatchError, "invalid death classification status"
+            ):
+                batch._validate_death_classification(
+                    run_dir,
+                    "Q1",
+                    {"cause": True, "manner": True, "occupation": False},
+                    evidence_artifact,
+                )
+
+    def test_semantic_classification_may_infer_manner_from_cause(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            evidence_artifact = {
+                "schema_version": 1,
+                "wikidata_id": "Q1",
+                "evidence": [
+                    {
+                        "evidence_id": "E1",
+                        "source_tier": "rest_of_article",
+                        "section": "Illness and death",
+                        "text": "She had cancer, her health worsened, and she died.",
+                    }
+                ],
+                "no_usable_account": {"cause": False, "manner": True},
+                "reason": "Cancer is described but manner is not separately labeled.",
+            }
+            batch.atomic_write_json(
+                run_dir / "semantic" / "death-classification" / "Q1.json",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "cause": [{"label": "cancer", "qid": ""}],
+                    "manner": [{"label": "natural causes", "qid": ""}],
+                    "status": "settled",
+                    "evidence_ids": {"cause": ["E1"], "manner": ["E1"]},
+                    "reason": "Natural causes is inferred directly from cancer.",
+                },
+            )
+            parsed = batch._validate_death_classification(
+                run_dir,
+                "Q1",
+                {"cause": True, "manner": True, "occupation": False},
+                evidence_artifact,
+            )
+            self.assertEqual(parsed["manner"][0]["label"], "natural causes")
 
     def test_possible_removal_is_queued_terminal_and_preserves_fallbacks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -735,6 +912,82 @@ class StagingAndApplyTests(unittest.TestCase):
             self.assertEqual(rows[0]["wikipedia_death_review_status"], "possible_removal")
             selected, eligible_count = batch.select_eligible(rows, 10)
             self.assertEqual((selected, eligible_count), ([], 0))
+
+    def test_migrate_removes_possible_removal_and_appends_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_people = root / "live.csv"
+            staged_people = root / "staged.csv"
+            live_review = root / "live-review.csv"
+            staged_review = root / "staged-review.csv"
+            removed = root / "removed_entries.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            rows = [blank_row("Q1", "Living Person", "2024"), blank_row("Q2", "Other", "2023")]
+            write_csv(live_people, TEST_COLUMNS, rows)
+            write_csv(staged_people, TEST_COLUMNS, rows)
+            write_csv(live_review, batch.REVIEW_COLUMNS, [{
+                **{column: "" for column in batch.REVIEW_COLUMNS},
+                "wikidata_id": "Q1",
+                "status": "possible_removal",
+            }])
+            write_csv(staged_review, batch.REVIEW_COLUMNS, [])
+            batch.create_cohort(
+                people_csv=staged_people,
+                cache_root=cache,
+                batch_size=2,
+                run_dir=run_dir,
+            )
+            proposals = [
+                {
+                    "wikidata_id": "Q1",
+                    "status": "possible_removal",
+                    "article_eligibility": {"removal_reasons": ["living"]},
+                },
+                {"wikidata_id": "Q2", "status": "settled"},
+            ]
+            proposals_path = run_dir / "proposals.jsonl"
+            batch.write_proposals(proposals_path, proposals)
+            original_validator = batch.validate_proposals
+            batch.validate_proposals = lambda **_kwargs: {}
+            try:
+                result = batch.migrate_approved_cohort(
+                    cohort_value=run_dir,
+                    proposals_path=proposals_path,
+                    staged_people_csv=staged_people,
+                    staged_review_csv=staged_review,
+                    live_people_csv=live_people,
+                    live_review_csv=live_review,
+                    removed_csv=removed,
+                    cache_root=cache,
+                )
+            finally:
+                batch.validate_proposals = original_validator
+            self.assertEqual(result["removed_rows"], 1)
+            _, live_rows = batch.read_csv(live_people)
+            self.assertEqual([row["wikidata_id"] for row in live_rows], ["Q2"])
+            _, ledger_rows = batch.read_csv(removed)
+            self.assertEqual(ledger_rows[0]["wikidata_id"], "Q1")
+            self.assertEqual(ledger_rows[0]["removal_reason"], "living")
+            _, review_rows = batch.read_csv(live_review)
+            self.assertEqual(review_rows, [])
+            batch.validate_proposals = lambda **_kwargs: {}
+            try:
+                repeated = batch.migrate_approved_cohort(
+                    cohort_value=run_dir,
+                    proposals_path=proposals_path,
+                    staged_people_csv=staged_people,
+                    staged_review_csv=staged_review,
+                    live_people_csv=live_people,
+                    live_review_csv=live_review,
+                    removed_csv=removed,
+                    cache_root=cache,
+                )
+            finally:
+                batch.validate_proposals = original_validator
+            self.assertEqual(repeated["removed_rows"], 0)
+            self.assertEqual(repeated["already_ledgered_rows"], 1)
+            self.assertEqual(len(batch.read_csv(removed)[1]), 1)
 
     def test_non_english_person_article_redeems_english_list_redirect(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -838,6 +1091,537 @@ class StagingAndApplyTests(unittest.TestCase):
             self.assertEqual(result["validated"], 1)
 
 
+class ParallelSemanticPipelineTests(unittest.TestCase):
+    def test_artifacts_are_owned_immutable_and_stream_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            row = blank_row("Q1", "Person", "2024")
+            write_csv(people, TEST_COLUMNS, [row])
+            batch.create_cohort(
+                people_csv=people, cache_root=cache, batch_size=1, run_dir=run_dir
+            )
+            write_article_and_packet(
+                cache, run_dir, "Q1", "Person", "'''Person''' was an actor."
+            )
+            eligibility = {
+                "schema_version": 1,
+                "wikidata_id": "Q1",
+                "reviews": {"enwiki": semantic_page_review()},
+            }
+            install_artifact(run_dir, "eligibility", "Q1", eligibility)
+            with self.assertRaisesRegex(batch.BatchError, "already exists"):
+                install_artifact(run_dir, "eligibility", "Q1", eligibility)
+            outside = run_dir / "outside.json"
+            batch.atomic_write_json(
+                outside,
+                {"schema_version": 1, "wikidata_id": "Q999", "reviews": {}},
+            )
+            with self.assertRaisesRegex(batch.BatchError, "outside the cohort"):
+                batch.record_semantic_artifact(
+                    cohort_value=run_dir,
+                    role="eligibility",
+                    qid="Q999",
+                    input_path=outside,
+                )
+
+            batch.aggregate_eligibility(cohort_value=run_dir)
+            first_status = batch.stage_status(cohort_value=run_dir)["people"][0]["roles"]
+            self.assertEqual(first_status["death-evidence"], "ready")
+            self.assertEqual(first_status["death-classification"], "blocked")
+            self.assertEqual(first_status["identity"], "ready")
+            batch.mark_semantic_task(
+                cohort_value=run_dir,
+                role="death-evidence",
+                qid="Q1",
+                status="running",
+            )
+            self.assertEqual(
+                batch.stage_status(cohort_value=run_dir)["people"][0]["roles"][
+                    "death-evidence"
+                ],
+                "running",
+            )
+
+            install_artifact(
+                run_dir,
+                "death-evidence",
+                "Q1",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "evidence": [
+                        {
+                            "evidence_id": "E1",
+                            "source_tier": "lead_sentence",
+                            "section": "Lead",
+                            "text": "Person died in an accident.",
+                        }
+                    ],
+                    "no_usable_account": {"cause": False, "manner": False},
+                    "reason": "The lead supplies the death account.",
+                },
+            )
+            second_status = batch.stage_status(cohort_value=run_dir)["people"][0]["roles"]
+            self.assertEqual(second_status["death-classification"], "ready")
+            identity_input = json.loads(
+                batch.build_role_input(
+                    cohort_value=run_dir, role="identity", qid="Q1"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                set(identity_input["lead"]),
+                {
+                    "lead_sentence",
+                    "rest_of_lead_paragraph",
+                    "remaining_lead_section",
+                    "infobox",
+                },
+            )
+            self.assertNotIn("rest_of_article", identity_input["lead"])
+            classification_input = json.loads(
+                batch.build_role_input(
+                    cohort_value=run_dir,
+                    role="death-classification",
+                    qid="Q1",
+                    vocabulary_path=root / "approved.json",
+                ).read_text(encoding="utf-8")
+            )
+            self.assertIn("homicide", classification_input["canonical_labels"]["cause"])
+            self.assertEqual(
+                set(classification_input["status_definitions"]),
+                {"settled", "unknown"},
+            )
+            self.assertEqual(
+                classification_input["evidence_bundle"]["evidence"][0]["evidence_id"],
+                "E1",
+            )
+            batch.atomic_write_json(
+                run_dir / "semantic" / "identity" / "Q999.json",
+                {"schema_version": 1, "wikidata_id": "Q999"},
+            )
+            with self.assertRaisesRegex(batch.BatchError, "Out-of-cohort identity"):
+                batch.assemble_semantic_proposals(cohort_value=run_dir)
+
+    def test_largest_qualifying_alternate_is_selected_deterministically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            write_csv(people, TEST_COLUMNS, [blank_row("Q1", "Person", "2024")])
+            batch.create_cohort(
+                people_csv=people, cache_root=cache, batch_size=1, run_dir=run_dir
+            )
+            write_article_and_packet(
+                cache, run_dir, "Q1", "Person", "'''A list''' contains people."
+            )
+            index = {"Q1": []}
+            for candidate_id, size in (("dewiki", 100), ("frwiki", 200)):
+                packet = run_dir / "alternate-packets" / "Q1" / f"{candidate_id}.json"
+                batch.atomic_write_json(packet, {"schema_version": 3})
+                index["Q1"].append(
+                    {
+                        "candidate_id": candidate_id,
+                        "article_bytes": size,
+                        "packet": str(packet.relative_to(run_dir)),
+                    }
+                )
+            batch.atomic_write_json(run_dir / "alternate_article_index.json", index)
+            install_artifact(
+                run_dir,
+                "eligibility",
+                "Q1",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "reviews": {
+                        "enwiki": semantic_page_review(
+                            page_kind="list",
+                            subject_match="mismatch",
+                            reason="The English target is a list.",
+                        )
+                    },
+                },
+            )
+            install_artifact(
+                run_dir,
+                "alternate-eligibility",
+                "Q1",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "reviews": {
+                        "dewiki": semantic_page_review(),
+                        "frwiki": semantic_page_review(),
+                    },
+                },
+            )
+            result = batch.aggregate_eligibility(cohort_value=run_dir)
+            self.assertEqual(result["people"]["Q1"]["selected_article"], "frwiki")
+
+    def test_alternate_fetch_is_a_serial_noop_when_all_english_pages_qualify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            write_csv(people, TEST_COLUMNS, [blank_row("Q1", "Person", "2024")])
+            batch.create_cohort(
+                people_csv=people, cache_root=cache, batch_size=1, run_dir=run_dir
+            )
+            install_artifact(
+                run_dir,
+                "eligibility",
+                "Q1",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "reviews": {"enwiki": semantic_page_review()},
+                },
+            )
+            result = batch.fetch_alternate_articles(
+                cohort_value=run_dir, proposals_path=None, cache_root=cache
+            )
+            self.assertEqual(
+                result,
+                {"requested_people": 0, "alternate_articles": 0, "article_bytes": 0},
+            )
+
+    def test_failed_qid_does_not_block_ready_work_but_blocks_assembly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            rows = [blank_row("Q1", "First", "2024"), blank_row("Q2", "Second", "2023")]
+            for row in rows:
+                row["occupations"] = "actor"
+            write_csv(people, TEST_COLUMNS, rows)
+            before = people.read_bytes()
+            batch.create_cohort(
+                people_csv=people, cache_root=cache, batch_size=2, run_dir=run_dir
+            )
+            for qid, name in (("Q1", "First"), ("Q2", "Second")):
+                write_article_and_packet(
+                    cache,
+                    run_dir,
+                    qid,
+                    name,
+                    f"'''{name}''' was an actor.\n\n==Death==\n{name} died in a crash.",
+                )
+                install_artifact(
+                    run_dir,
+                    "eligibility",
+                    qid,
+                    {
+                        "schema_version": 1,
+                        "wikidata_id": qid,
+                        "reviews": {"enwiki": semantic_page_review()},
+                    },
+                )
+            batch.aggregate_eligibility(cohort_value=run_dir)
+            install_artifact(
+                run_dir,
+                "death-evidence",
+                "Q1",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "evidence": [],
+                    "no_usable_account": False,
+                    "reason": "Malformed worker result for the failure-path test.",
+                },
+            )
+            install_artifact(
+                run_dir,
+                "death-evidence",
+                "Q2",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q2",
+                    "evidence": [
+                        {
+                            "evidence_id": "E1",
+                            "source_tier": "rest_of_article",
+                            "section": "Death",
+                            "text": "Second died in a crash.",
+                        }
+                    ],
+                    "no_usable_account": {"cause": False, "manner": False},
+                    "reason": "The death account is usable.",
+                },
+            )
+            states = {
+                item["wikidata_id"]: item["roles"]
+                for item in batch.stage_status(cohort_value=run_dir)["people"]
+            }
+            self.assertEqual(states["Q1"]["death-evidence"], "failed")
+            self.assertEqual(states["Q1"]["death-classification"], "blocked")
+            self.assertEqual(states["Q2"]["death-evidence"], "complete")
+            self.assertEqual(states["Q2"]["death-classification"], "ready")
+            with self.assertRaisesRegex(batch.BatchError, "no_usable_account"):
+                batch.assemble_semantic_proposals(cohort_value=run_dir)
+            self.assertEqual(people.read_bytes(), before)
+
+    def test_regressions_assemble_in_cohort_order_and_resolve_trusted_qids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            rows = []
+            for qid, name, manner, occupation in (
+                ("Q1", "Gladys Aranza Ramos Gurrola", "homicide", "activist"),
+                ("Q2", "Koyan Chamitha", "", "naval officer"),
+                ("Q3", "Hayden Kennedy", "suicide", "mountaineer"),
+            ):
+                row = blank_row(qid, name, "2024")
+                row["manner_of_death"] = manner
+                row["occupations"] = occupation
+                rows.append(row)
+            write_csv(people, TEST_COLUMNS, rows)
+            public_before = people.read_bytes()
+            batch.create_cohort(
+                people_csv=people, cache_root=cache, batch_size=3, run_dir=run_dir
+            )
+            passages = {
+                "Q1": "She was murdered while searching for her husband. Cause: homicide.",
+                "Q2": "Initial reports indicated a possible heart attack; a formal inquiry was opened to determine the exact cause.",
+                "Q3": "Kennedy died by suicide.",
+            }
+            names = {row["wikidata_id"]: row["name"] for row in rows}
+            for qid in ("Q3", "Q1", "Q2"):
+                write_article_and_packet(
+                    cache,
+                    run_dir,
+                    qid,
+                    names[qid],
+                    f"'''{names[qid]}''' was notable.\n\n==Death==\n{passages[qid]}",
+                )
+                install_artifact(
+                    run_dir,
+                    "eligibility",
+                    qid,
+                    {
+                        "schema_version": 1,
+                        "wikidata_id": qid,
+                        "reviews": {"enwiki": semantic_page_review()},
+                    },
+                )
+            batch.aggregate_eligibility(cohort_value=run_dir)
+
+            classifications = {
+                "Q1": ("homicide", None, "settled"),
+                "Q2": ("myocardial infarction", "natural causes", "settled"),
+                "Q3": ("suicide", None, "settled"),
+            }
+            for qid in ("Q2", "Q3", "Q1"):
+                install_artifact(
+                    run_dir,
+                    "death-evidence",
+                    qid,
+                    {
+                        "schema_version": 1,
+                        "wikidata_id": qid,
+                        "evidence": [
+                            {
+                                "evidence_id": "E1",
+                                "source_tier": "rest_of_article",
+                                "section": "Death",
+                                "text": passages[qid],
+                            }
+                        ],
+                        "no_usable_account": {"cause": False, "manner": False},
+                        "reason": "The complete death passage was extracted.",
+                    },
+                )
+                cause, manner, status = classifications[qid]
+                install_artifact(
+                    run_dir,
+                    "death-classification",
+                    qid,
+                    {
+                        "schema_version": 1,
+                        "wikidata_id": qid,
+                        "cause": [{"label": cause, "qid": ""}],
+                        "manner": (
+                            [{"label": manner, "qid": ""}]
+                            if manner is not None
+                            else None
+                        ),
+                        "status": status,
+                        "evidence_ids": {
+                            "cause": ["E1"],
+                            "manner": ["E1"] if manner is not None else [],
+                        },
+                        "reason": "The evidence directly supports this classification.",
+                    },
+                )
+
+            proposals_path = run_dir / "proposals.jsonl"
+            batch.assemble_semantic_proposals(
+                cohort_value=run_dir, output=proposals_path
+            )
+            proposals = batch.load_proposals(proposals_path)
+            self.assertEqual([item["wikidata_id"] for item in proposals], ["Q1", "Q2", "Q3"])
+            self.assertEqual([item["status"] for item in proposals], ["settled", "settled", "settled"])
+            unresolved = batch.resolve_known_vocabulary(
+                proposals_path=proposals_path,
+                people_csv=people,
+                vocabulary_path=root / "approved-vocabulary.json",
+            )
+            self.assertEqual(unresolved, [])
+            resolved = {item["wikidata_id"]: item for item in batch.load_proposals(proposals_path)}
+            self.assertEqual(resolved["Q1"]["cause"], [{"label": "homicide", "qid": "Q149086"}])
+            self.assertEqual(resolved["Q2"]["cause"], [{"label": "myocardial infarction", "qid": "Q12152"}])
+            self.assertEqual(resolved["Q3"]["cause"], [{"label": "suicide", "qid": "Q10737"}])
+            validated = batch.validate_proposals(
+                cohort_value=run_dir,
+                proposals_path=proposals_path,
+                people_csv=people,
+                cache_root=cache,
+            )
+            self.assertEqual(validated["validated"], 3)
+            self.assertEqual(people.read_bytes(), public_before)
+
+    def test_vocabulary_is_field_specific_and_not_fuzzy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trusted = root / "trusted.json"
+            batch.atomic_write_json(
+                trusted,
+                {
+                    "schema_version": 1,
+                    "mappings": {
+                        "cause": {"shared label": {"label": "Shared Label", "qid": "Q1"}},
+                        "manner": {"shared label": {"label": "Shared Label", "qid": "Q2"}},
+                        "occupation": {},
+                    },
+                },
+            )
+            proposals = root / "proposals.jsonl"
+            batch.write_proposals(
+                proposals,
+                [
+                    {
+                        "wikidata_id": "Q10",
+                        "cause": [{"label": "  SHARED   LABEL ", "qid": ""}],
+                        "manner": [{"label": "shared label", "qid": ""}],
+                        "occupation": [{"label": "shared labels", "qid": ""}],
+                    }
+                ],
+            )
+            unresolved = batch.resolve_known_vocabulary(
+                proposals_path=proposals,
+                people_csv=root / "unused.csv",
+                vocabulary_path=root / "approved.json",
+                trusted_vocabulary_path=trusted,
+            )
+            resolved = batch.load_proposals(proposals)[0]
+            self.assertEqual(resolved["cause"][0]["qid"], "Q1")
+            self.assertEqual(resolved["manner"][0]["qid"], "Q2")
+            self.assertEqual(
+                unresolved,
+                [
+                    {
+                        "field": "occupation",
+                        "label": "shared labels",
+                        "normalized_label": "shared labels",
+                    }
+                ],
+            )
+
+    def test_novel_vocabulary_artifact_applies_and_persists_reviewed_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            write_csv(people, TEST_COLUMNS, [blank_row("Q1", "Person", "2024")])
+            batch.create_cohort(
+                people_csv=people, cache_root=cache, batch_size=1, run_dir=run_dir
+            )
+            proposals = run_dir / "proposals.jsonl"
+            batch.write_proposals(
+                proposals,
+                [{"wikidata_id": "Q1", "cause": [{"label": "novel label", "qid": ""}]}],
+            )
+            unresolved = [
+                {
+                    "field": "cause",
+                    "label": "novel label",
+                    "normalized_label": "novel label",
+                }
+            ]
+            batch.atomic_write_json(run_dir / "unresolved_vocabulary.json", unresolved)
+            batch.atomic_write_json(
+                run_dir / "vocabulary_candidates.json",
+                {
+                    "schema_version": 1,
+                    "items": [
+                        {
+                            **unresolved[0],
+                            "candidates": [
+                                {
+                                    "id": "Q123",
+                                    "label": "Canonical novel concept",
+                                    "description": "the exact requested concept",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+            worker_output = root / "vocabulary-result.json"
+            batch.atomic_write_json(
+                worker_output,
+                {
+                    "schema_version": 1,
+                    "field": "cause",
+                    "label": "novel label",
+                    "decision": "approved",
+                    "selected_qid": "Q123",
+                    "reason": "The candidate expresses the exact concept.",
+                },
+            )
+            batch.record_vocabulary_artifact(
+                cohort_value=run_dir, input_path=worker_output
+            )
+            approved = root / "approved.json"
+            result = batch.apply_vocabulary_artifacts(
+                cohort_value=run_dir,
+                proposals_path=proposals,
+                vocabulary_path=approved,
+            )
+            self.assertEqual(result, {"resolved": 1})
+            self.assertEqual(
+                batch.load_proposals(proposals)[0]["cause"],
+                [{"label": "Canonical novel concept", "qid": "Q123"}],
+            )
+            stored = json.loads(approved.read_text(encoding="utf-8"))
+            self.assertEqual(stored["mappings"]["cause"]["novel label"]["qid"], "Q123")
+            followup = root / "followup.jsonl"
+            batch.write_proposals(
+                followup,
+                [{"wikidata_id": "Q2", "cause": [{"label": "Novel Label", "qid": ""}]}],
+            )
+            self.assertEqual(
+                batch.resolve_known_vocabulary(
+                    proposals_path=followup,
+                    people_csv=people,
+                    vocabulary_path=approved,
+                ),
+                [],
+            )
+            self.assertEqual(
+                batch.load_proposals(followup)[0]["cause"],
+                [{"label": "Canonical novel concept", "qid": "Q123"}],
+            )
+
+
 class RedoPreparationTests(unittest.TestCase):
     def test_prepare_redo_backs_up_clears_and_freezes_exact_target(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -906,7 +1690,375 @@ class RedoPreparationTests(unittest.TestCase):
             self.assertEqual(status["target_remaining"], 3)
 
 
+class RefillableSchedulerTests(unittest.TestCase):
+    def test_all_eligible_selection_freezes_approval_tranches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            rows = [blank_row(f"Q{index}", f"Person {index}", "2024") for index in range(1, 206)]
+            write_csv(people, TEST_COLUMNS, rows)
+            run_dir = root / "run"
+            batch.create_cohort(
+                people_csv=people,
+                cache_root=root / "cache",
+                batch_size=None,
+                run_dir=run_dir,
+            )
+            cohort = json.loads((run_dir / "cohort.json").read_text(encoding="utf-8"))
+            self.assertEqual(cohort["selection_mode"], "all_eligible")
+            self.assertEqual(cohort["selected_count"], 205)
+            self.assertEqual(
+                [cohort["selected"][index]["approval_tranche"] for index in (0, 99, 100, 199, 200)],
+                [1, 1, 2, 2, 3],
+            )
+
+    def test_claims_enforce_three_slots_and_byte_capped_singletons(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            rows = [blank_row(f"Q{index}", f"Person {index}", "2024") for index in range(1, 5)]
+            write_csv(people, TEST_COLUMNS, rows)
+            run_dir = root / "run"
+            cache = root / "cache"
+            batch.create_cohort(people_csv=people, cache_root=cache, batch_size=None, run_dir=run_dir)
+            for row in rows:
+                write_article_and_packet(
+                    cache,
+                    run_dir,
+                    row["wikidata_id"],
+                    row["name"],
+                    f"'''{row['name']}''' was notable.\n" + ("x" * 300_000),
+                )
+            direct = root / "direct.json"
+            batch.atomic_write_json(
+                direct,
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "reviews": {"enwiki": semantic_page_review()},
+                },
+            )
+            with self.assertRaisesRegex(batch.BatchError, "complete-assignment"):
+                batch.record_semantic_artifact(
+                    cohort_value=run_dir,
+                    role="eligibility",
+                    qid="Q1",
+                    input_path=direct,
+                )
+            claims = [
+                batch.claim_assignment(cohort_value=run_dir, slot=slot)
+                for slot in (1, 2, 3)
+            ]
+            self.assertTrue(all(item["role"] == "eligibility" for item in claims))
+            self.assertTrue(all(len(item["items"]) == 1 for item in claims))
+            self.assertTrue(all(item["items"][0]["oversize_singleton"] for item in claims))
+            with self.assertRaisesRegex(batch.BatchError, "active lease"):
+                batch.claim_assignment(cohort_value=run_dir, slot=1)
+
+    def test_failed_work_gets_two_recoveries_then_enters_exception_lane(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            row = blank_row("Q1", "Person", "2024")
+            write_csv(people, TEST_COLUMNS, [row])
+            batch.create_cohort(people_csv=people, cache_root=cache, batch_size=None, run_dir=run_dir)
+            write_article_and_packet(cache, run_dir, "Q1", "Person", "'''Person''' was notable.")
+            for attempt in range(1, 4):
+                claim = batch.claim_assignment(cohort_value=run_dir, slot=1)
+                result = batch.complete_assignment(
+                    cohort_value=run_dir,
+                    assignment_id=claim["assignment_id"],
+                    input_path=None,
+                    failed_reason=f"diagnosed failure {attempt}",
+                )
+            self.assertEqual(result["failed"][0]["attempts"], "3")
+            status = batch.scheduler_status(cohort_value=run_dir)
+            self.assertEqual(len(status["exceptions"]), 1)
+            self.assertTrue(status["tranches"][0]["reviewable"])
+            self.assertEqual(status["ready_counts"]["eligibility"], 0)
+            self.assertEqual(status["processing_remaining"], 0)
+            self.assertTrue(status["processing_complete"])
+
+    def test_completion_preserves_valid_partial_results_and_rejects_extras(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            rows = [blank_row("Q1", "First", "2024"), blank_row("Q2", "Second", "2023")]
+            write_csv(people, TEST_COLUMNS, rows)
+            batch.create_cohort(people_csv=people, cache_root=cache, batch_size=None, run_dir=run_dir)
+            for row in rows:
+                write_article_and_packet(cache, run_dir, row["wikidata_id"], row["name"], f"'''{row['name']}''' was notable.")
+            claim = batch.claim_assignment(cohort_value=run_dir, slot=1)
+            output = root / "result.json"
+            batch.atomic_write_json(
+                output,
+                [
+                    {
+                        "schema_version": 1,
+                        "wikidata_id": "Q1",
+                        "reviews": {"enwiki": semantic_page_review()},
+                    },
+                    {
+                        "schema_version": 1,
+                        "wikidata_id": "Q999",
+                        "reviews": {"enwiki": semantic_page_review()},
+                    },
+                ],
+            )
+            result = batch.complete_assignment(
+                cohort_value=run_dir,
+                assignment_id=claim["assignment_id"],
+                input_path=output,
+            )
+            self.assertEqual(result["installed"], ["Q1"])
+            self.assertEqual(result["rejected_extra_keys"], ["Q999"])
+            self.assertTrue(batch.semantic_artifact_path(run_dir, "eligibility", "Q1").exists())
+            self.assertFalse(batch.semantic_artifact_path(run_dir, "eligibility", "Q999").exists())
+
+    def test_tranche_approval_hash_detects_post_review_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            review_csv = root / "review.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            musicians = root / "musicians.csv"
+            archive = root / "archive.html"
+            row = blank_row("Q1", "Person", "2024")
+            write_csv(people, TEST_COLUMNS, [row])
+            write_csv(musicians, ["wikidata_id"], [])
+            archive.write_text("<table></table>", encoding="utf-8")
+            batch.create_cohort(people_csv=people, cache_root=cache, batch_size=None, run_dir=run_dir)
+            write_article_and_packet(cache, run_dir, "Q1", "Person", "'''Person''' is alive.")
+            claim = batch.claim_assignment(cohort_value=run_dir, slot=1)
+            worker_output = root / "eligibility-result.json"
+            batch.atomic_write_json(
+                worker_output,
+                [{
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "reviews": {
+                        "enwiki": semantic_page_review(
+                            life_status="living",
+                            reason="The biography says the subject is living.",
+                        )
+                    },
+                }],
+            )
+            batch.complete_assignment(
+                cohort_value=run_dir,
+                assignment_id=claim["assignment_id"],
+                input_path=worker_output,
+            )
+            original_musicians = batch.MUSICIANS_CSV
+            original_archive = batch.CLUB_ARCHIVE_HTML
+            try:
+                batch.MUSICIANS_CSV = musicians
+                batch.CLUB_ARCHIVE_HTML = archive
+                batch.atomic_write_json(
+                    run_dir / "alternate_article_index.json", {"Q1": []}
+                )
+                batch.aggregate_eligibility(cohort_value=run_dir, ready_only=True)
+                proposals = run_dir / "tranches" / "001" / "proposals.jsonl"
+                batch.assemble_semantic_proposals(
+                    cohort_value=run_dir, output=proposals, tranche=1
+                )
+                batch.apply_proposals(
+                    cohort_value=run_dir,
+                    proposals_path=proposals,
+                    people_csv=people,
+                    review_csv=review_csv,
+                    cache_root=cache,
+                    tranche=1,
+                )
+                verified = batch.verify_batch(
+                    cohort_value=run_dir,
+                    people_csv=people,
+                    musicians_csv=musicians,
+                    review_csv=review_csv,
+                    rebuild_browser=False,
+                    run_tests=False,
+                    expected_qids=["Q1"],
+                )
+                self.assertEqual(verified["completed"], 1)
+                prepared = batch.prepare_tranche_review(
+                    cohort_value=run_dir,
+                    tranche=1,
+                    proposals_path=proposals,
+                    staged_people_csv=people,
+                    staged_review_csv=review_csv,
+                )
+                manifest = Path(prepared["review_manifest"])
+                with self.assertRaisesRegex(batch.BatchError, "does not match"):
+                    batch.record_tranche_approval(
+                        review_manifest=manifest, reviewed_hash="0" * 64
+                    )
+                approval = batch.record_tranche_approval(
+                    review_manifest=manifest, reviewed_hash=prepared["review_hash"]
+                )
+                _, staged_rows = batch.read_csv(people)
+                staged_rows[0]["name"] = "Changed after review"
+                write_csv(people, TEST_COLUMNS, staged_rows)
+                cohort = batch.cohort_paths(run_dir)[1]
+                with self.assertRaisesRegex(batch.BatchError, "changed after approval"):
+                    batch._validated_approval(cohort=cohort, approval_path=approval)
+            finally:
+                batch.MUSICIANS_CSV = original_musicians
+                batch.CLUB_ARCHIVE_HTML = original_archive
+
+    def test_review_correction_does_not_invalidate_accepted_items(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            review_csv = root / "review.csv"
+            proposals = root / "proposals.jsonl"
+            run_dir = root / "run"
+            rows = [
+                blank_row("Q1", "Accepted", "2024"),
+                blank_row("Q2", "Needs correction", "2023"),
+            ]
+            write_csv(people, TEST_COLUMNS, rows)
+            write_csv(review_csv, batch.REVIEW_COLUMNS, [])
+            batch.write_proposals(
+                proposals,
+                [{"wikidata_id": "Q1"}, {"wikidata_id": "Q2"}],
+            )
+            batch.create_cohort(
+                people_csv=people,
+                cache_root=root / "cache",
+                batch_size=None,
+                run_dir=run_dir,
+            )
+            cohort = batch.cohort_paths(run_dir)[1]
+            qids = ["Q1", "Q2"]
+            payload = batch._review_payload(
+                qids=qids,
+                proposals_path=proposals,
+                staged_people_csv=people,
+                staged_review_csv=review_csv,
+            )
+            review_hash = hashlib.sha256(
+                batch.canonical_json(payload).encode()
+            ).hexdigest()
+            manifest = run_dir / "scheduler" / "reviews" / "tranche-001.json"
+            batch.atomic_write_json(
+                manifest,
+                {
+                    "schema_version": 1,
+                    "cohort_hash": cohort["cohort_hash"],
+                    "tranche": 1,
+                    "qids": qids,
+                    "proposals": str(proposals),
+                    "staged_people_csv": str(people),
+                    "staged_review_csv": str(review_csv),
+                    "review_hash": review_hash,
+                },
+            )
+            correction = batch.queue_review_correction(
+                cohort_value=run_dir,
+                review_manifest=manifest,
+                qid="Q2",
+                reason="User requested a different occupation",
+            )
+            self.assertEqual(correction["role"], "correction")
+            updated_review = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(set(updated_review["item_hashes"]), set(qids))
+            approval_path = batch.record_tranche_approval(
+                review_manifest=manifest,
+                reviewed_hash=review_hash,
+            )
+            approval = json.loads(approval_path.read_text(encoding="utf-8"))
+            self.assertEqual(approval["approved_qids"], ["Q1"])
+            self.assertEqual(approval["correction_qids"], ["Q2"])
+
+            _, changed_rows = batch.read_csv(people)
+            changed_rows[1]["name"] = "Corrected after review"
+            write_csv(people, TEST_COLUMNS, changed_rows)
+            batch._validated_approval(cohort=cohort, approval_path=approval_path)
+
+            changed_rows[0]["name"] = "Accepted row changed"
+            write_csv(people, TEST_COLUMNS, changed_rows)
+            with self.assertRaisesRegex(batch.BatchError, "Reviewed item changed"):
+                batch._validated_approval(cohort=cohort, approval_path=approval_path)
+
+
 class ArticleEligibilityTests(unittest.TestCase):
+    def test_no_dedicated_article_stays_for_musician_or_archived_club_member(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            rows = [
+                blank_row("Q1", "Musician Example", "2024"),
+                blank_row("Q2", "Archived Example", "2024"),
+            ]
+            rows[0]["occupations"] = "bassist"
+            write_csv(people, TEST_COLUMNS, rows)
+            batch.create_cohort(
+                people_csv=people, cache_root=cache, batch_size=2, run_dir=run_dir
+            )
+            for qid, name in (("Q1", "Musician Example"), ("Q2", "Archived Example")):
+                write_article_and_packet(
+                    cache,
+                    run_dir,
+                    qid,
+                    name,
+                    f"'''{name}''' redirects to a group or list entry.",
+                )
+                install_artifact(
+                    run_dir,
+                    "eligibility",
+                    qid,
+                    {
+                        "schema_version": 1,
+                        "wikidata_id": qid,
+                        "reviews": {
+                            "enwiki": semantic_page_review(
+                                page_kind="group",
+                                age_compatibility="unknown",
+                                reason="The final page is not a dedicated biography.",
+                            )
+                        },
+                    },
+                )
+            musicians_csv = root / "musicians.csv"
+            write_csv(musicians_csv, ["wikidata_id"], [{"wikidata_id": "Q1"}])
+            archive_html = root / "purported-27-club-members.html"
+            archive_html.write_text(
+                "<table><tr><th>Name</th></tr>"
+                '<tr><td><a href="https://en.wikipedia.org/wiki/Archived_Example">'
+                "Archived Example</a></td></tr></table>",
+                encoding="utf-8",
+            )
+            original_musicians = batch.MUSICIANS_CSV
+            original_archive = batch.CLUB_ARCHIVE_HTML
+            batch.MUSICIANS_CSV = musicians_csv
+            batch.CLUB_ARCHIVE_HTML = archive_html
+            try:
+                selected = batch.aggregate_eligibility(cohort_value=run_dir)
+                self.assertEqual(
+                    selected["people"]["Q1"]["stay_overrides"],
+                    ["approved_musician_occupation"],
+                )
+                self.assertEqual(
+                    selected["people"]["Q2"]["stay_overrides"],
+                    ["archived_27_club_article"],
+                )
+                self.assertEqual(
+                    selected["people"]["Q1"]["decision"], "eligible"
+                )
+                self.assertEqual(
+                    selected["people"]["Q2"]["decision"], "eligible"
+                )
+            finally:
+                batch.MUSICIANS_CSV = original_musicians
+                batch.CLUB_ARCHIVE_HTML = original_archive
+
     def test_possible_removal_reason_variants_validate(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)

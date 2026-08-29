@@ -286,6 +286,35 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(rows[0]["wikipedia_death_review_status"], "disputed")
         self.assertEqual(rows[1]["wikipedia_cause_of_death"], "")
 
+    def test_removed_entries_are_excluded_from_future_rows(self):
+        rows = [
+            {column: "" for column in people27.CSV_COLUMNS},
+            {column: "" for column in people27.CSV_COLUMNS},
+        ]
+        rows[0]["wikidata_id"] = "Q1"
+        rows[1]["wikidata_id"] = "Q2"
+        kept, removed = people27.exclude_removed_rows(rows, {"Q1"})
+        self.assertEqual(removed, 1)
+        self.assertEqual([row["wikidata_id"] for row in kept], ["Q2"])
+
+    def test_removed_entry_ledger_requires_permanent_audit_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "removed_entries.csv"
+            row = {column: "" for column in people27.REMOVED_ENTRY_COLUMNS}
+            row.update(
+                {
+                    "wikidata_id": "Q1",
+                    "removal_reason": "living",
+                    "removed_utc": "2026-08-28T00:00:00+00:00",
+                    "source_run_dir": "/tmp/run",
+                }
+            )
+            with ledger.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=people27.REMOVED_ENTRY_COLUMNS)
+                writer.writeheader()
+                writer.writerow(row)
+            self.assertEqual(people27.load_removed_qids(ledger), {"Q1"})
+
     def test_wikipedia_pairs_validate_order_alignment_somevalue_and_status(self):
         person = RawPerson(
             "Q1",
