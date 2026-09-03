@@ -2,6 +2,7 @@
   'use strict';
 
   const data = window.AGE27_DATA;
+  const totalPeople = data.people.length;
   const musicianIds = new Set(data.musicians.map((row) => row.q));
   const firstYear = (value) => {
     const match = String(value).match(/^-?\d{1,6}/);
@@ -31,8 +32,7 @@
     occupationButton: $('#occupation-filter-button'), occupationSummary: $('#occupation-filter-summary'),
     occupationPanel: $('#occupation-filter-panel'), occupationGroups: $('#occupation-groups'),
     sort: $('#sort-order'), count: $('#result-count'), context: $('#result-context'), list: $('#record-list'),
-    sentinel: $('#scroll-sentinel'), empty: $('#empty-state'), donut: $('#status-donut'), confirmedPct: $('#confirmed-pct'),
-    confirmedCount: $('#confirmed-count'), possibleCount: $('#possible-count'), bars: $('#occupation-bars'),
+    sentinel: $('#scroll-sentinel'), empty: $('#empty-state'), bars: $('#occupation-bars'),
     timeline: $('#timeline'), timelineLegend: $('#timeline-legend'), tooltip: $('#timeline-tooltip'),
     zoomStart: $('#zoom-start'), zoomEnd: $('#zoom-end'), zoomSelection: $('#zoom-selection'),
     zoomReadout: $('#zoom-readout'), zoomCount: $('#zoom-count'),
@@ -188,20 +188,8 @@
     elements.count.textContent = fmt.format(filtered.length);
     elements.context.textContent = `${formatYear(state.zoomStart)}–${formatYear(state.zoomEnd)} · ${occupationSelectionLabel()}`;
     renderTimeline();
-    renderStatus();
     renderOccupations();
     renderRecords();
-  }
-
-  function renderStatus() {
-    const confirmed = filtered.filter((row) => row.s === 'confirmed').length;
-    const possible = filtered.length - confirmed;
-    const percent = filtered.length ? Math.round(confirmed / filtered.length * 100) : 0;
-    elements.donut.style.setProperty('--confirmed-angle', `${percent * 3.6}deg`);
-    elements.confirmedPct.textContent = `${percent}%`;
-    elements.confirmedCount.textContent = fmt.format(confirmed);
-    elements.possibleCount.textContent = fmt.format(possible);
-    elements.donut.setAttribute('aria-label', `${percent}% confirmed: ${confirmed} confirmed and ${possible} possible records`);
   }
 
   function occupationCounts(rows) {
@@ -352,18 +340,22 @@
 
   function renderRecords() {
     const visible = filtered.slice(0, state.shown);
+    const listValues = (values) => {
+      const known = values.filter((value) => value && value.toLocaleLowerCase() !== 'unknown');
+      return known.length ? known.map(escapeHtml).join(' · ') : 'Unknown';
+    };
     elements.list.innerHTML = visible.map((row) => `
       <div class="record-row">
-        <button class="record-card" type="button" data-detail-qid="${row.q}" aria-label="View details for ${escapeAttr(row.n)}">
+        <button class="record-card ${row.s}" type="button" data-detail-qid="${row.q}" aria-label="View details for ${escapeAttr(row.n)}">
           <span class="record-index"></span>
           <span class="record-name"><strong>${escapeHtml(row.n)}</strong><small>${row.q}${musicianIds.has(row.q) ? ' · musician' : ''}</small></span>
-          <span class="record-date"><small>Born</small><br>${escapeHtml(row.b)}</span>
-          <span class="record-date"><small>Died</small><br>${escapeHtml(row.d)}</span>
+          <span class="record-lived"><small>Lived</small><br>${escapeHtml(row.b)} — ${escapeHtml(row.d)}</span>
+          <span class="record-fact"><small>Cause of death</small><br>${listValues(row.c)}</span>
+          <span class="record-fact"><small>Manner of death</small><br>${listValues(row.m)}</span>
           <span class="record-occupations">${row.o.slice(0, 2).map((occupation) => `<i class="occupation-tag" style="--occupation-color:${occupationColor(occupation)}">${escapeHtml(occupation)}</i>`).join('') || '<i class="occupation-tag">unclassified</i>'}</span>
-          <span class="status-tag ${row.s}">${row.s}</span>
-          <span class="record-arrow">↗</span>
+          <span class="status-icon ${row.s}" role="img" aria-label="${row.s === 'confirmed' ? 'Confirmed age 27' : 'Possibly age 27'}" data-tooltip="${row.s === 'confirmed' ? 'Confirmed age 27' : 'Possibly age 27'}">${row.s === 'confirmed' ? '✓' : '≈'}</span>
         </button>
-        <a class="record-wikipedia" href="${escapeAttr(row.u)}" target="_blank" rel="noopener" aria-label="Open ${escapeAttr(row.n)} on Wikipedia">Wikipedia ↗</a>
+        <a class="record-wikipedia" href="${escapeAttr(row.u)}" target="_blank" rel="noopener" aria-label="Open ${escapeAttr(row.n)} on Wikipedia"><span aria-hidden="true">↗</span></a>
       </div>`).join('');
     elements.list.querySelectorAll('[data-detail-qid]').forEach((button) => button.addEventListener('click', () => openDetail(visible.find((row) => row.q === button.dataset.detailQid))));
     elements.empty.hidden = filtered.length !== 0;
@@ -374,22 +366,34 @@
   function openDetail(row) {
     if (!row) return;
     const isMusician = musicianIds.has(row.q);
-    const wikipediaFootnote = row.wc || row.wm || row.wo;
-    const detailValues = (values, wikipediaDerived, emptyCopy) => values.length
-      ? `${values.map(escapeHtml).join(' · ')}${wikipediaDerived ? '<sup title="English Wikipedia-derived fallback">1</sup>' : ''}`
-      : emptyCopy;
+    const hasKnownValues = (values) => values.some((value) => value && value.toLocaleLowerCase() !== 'unknown');
+    const hasWikipediaFallback = (row.wc && hasKnownValues(row.c)) || (row.wm && hasKnownValues(row.m)) || (row.wo && hasKnownValues(row.o));
+    const detailDate = (value) => value
+      ? `${escapeHtml(value)}<sup title="Wikidata">1</sup>`
+      : 'Unknown';
+    const detailValues = (values, wikipediaDerived) => {
+      const known = values.filter((value) => value && value.toLocaleLowerCase() !== 'unknown');
+      if (!known.length) return 'Unknown';
+      const sourceNumber = wikipediaDerived ? 2 : 1;
+      const sourceTitle = wikipediaDerived ? 'English Wikipedia-derived fallback' : 'Wikidata';
+      return `${known.map(escapeHtml).join(' · ')}<sup title="${sourceTitle}">${sourceNumber}</sup>`;
+    };
+    const wikidataUrl = `https://www.wikidata.org/wiki/${encodeURIComponent(row.q)}`;
     elements.dialogContent.innerHTML = `
       <div class="detail-hero"><p class="eyebrow">${row.q}${isMusician ? ' · musician collection' : ''}</p><h2>${escapeHtml(row.n)}</h2></div>
       <div class="detail-body">
-        <div class="detail-dates"><div><span>Arrived</span><strong>${escapeHtml(row.b)}</strong></div><div><span>Departed early</span><strong>${escapeHtml(row.d)}</strong></div></div>
+        <div class="detail-dates"><div><span>Arrived</span><strong>${detailDate(row.b)}</strong></div><div><span>Departed early</span><strong>${detailDate(row.d)}</strong></div></div>
         <div class="detail-fact"><span>How sure are we?</span><strong class="status-tag ${row.s}">${row.s}</strong></div>
         <div class="detail-fact"><span>Possible age range</span><strong>${escapeHtml(row.r)}</strong></div>
         <div class="detail-fact"><span>Total runtime</span><strong>${fmt.format(row.lo)}–${fmt.format(row.hi)} days</strong></div>
-        <div class="detail-fact"><span>Cause of death</span><strong>${detailValues(row.c, row.wc, 'Not recorded in Wikidata')}</strong></div>
-        <div class="detail-fact"><span>Manner of death</span><strong>${detailValues(row.m, row.wm, 'Not recorded in Wikidata')}</strong></div>
-        <div class="detail-fact"><span>Primary identity</span><strong>${detailValues(row.o, row.wo, 'No identity recorded in this dataset')}</strong></div>
-        ${wikipediaFootnote ? '<p class="detail-source-note"><sup>1</sup> English Wikipedia-derived fallback</p>' : ''}
-        <a class="detail-link" href="${escapeAttr(row.u)}" target="_blank" rel="noopener">Wikipedia ↗</a>
+        <div class="detail-fact"><span>Cause of death</span><strong>${detailValues(row.c, row.wc)}</strong></div>
+        <div class="detail-fact"><span>Manner of death</span><strong>${detailValues(row.m, row.wm)}</strong></div>
+        <div class="detail-fact"><span>Primary identity</span><strong>${detailValues(row.o, row.wo)}</strong></div>
+        <p class="detail-source-note"><span><sup>1</sup> Structured data from Wikidata</span>${hasWikipediaFallback ? '<span><sup>2</sup> English Wikipedia-derived fallback</span>' : ''}</p>
+        <div class="detail-links">
+          <a class="detail-link wikidata" href="${escapeAttr(wikidataUrl)}" target="_blank" rel="noopener">Wikidata ↗</a>
+          <a class="detail-link wikipedia" href="${escapeAttr(row.u)}" target="_blank" rel="noopener">Wikipedia ↗</a>
+        </div>
       </div>`;
     elements.dialog.showModal();
   }
@@ -425,10 +429,21 @@
   elements.timeline.addEventListener('click', (event) => { const point = event.target.closest?.('.life-point'); if (point) openDetail(timelineRows[Number(point.dataset.index)]); });
   elements.timeline.addEventListener('keydown', (event) => { if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('.life-point')) { event.preventDefault(); openDetail(timelineRows[Number(event.target.dataset.index)]); } });
 
-  let zoomTimer = 0;
+  let zoomFrame = 0;
+  let zoomSettleTimer = 0;
   function scheduleRangeRender() {
-    clearTimeout(zoomTimer);
-    zoomTimer = setTimeout(() => { state.shown = 24; render(); }, 70);
+    if (!zoomFrame) {
+      zoomFrame = requestAnimationFrame(() => {
+        zoomFrame = 0;
+        state.shown = 24;
+        applyFilters();
+        elements.count.textContent = fmt.format(filtered.length);
+        elements.context.textContent = `${formatYear(state.zoomStart)}–${formatYear(state.zoomEnd)} · ${occupationSelectionLabel()}`;
+        renderTimeline();
+      });
+    }
+    clearTimeout(zoomSettleTimer);
+    zoomSettleTimer = setTimeout(render, 90);
   }
   function handleZoomInput(changedHandle) {
     let start = Number(elements.zoomStart.value);
@@ -446,8 +461,8 @@
   }
   elements.zoomStart.addEventListener('input', () => handleZoomInput('start'));
   elements.zoomEnd.addEventListener('input', () => handleZoomInput('end'));
-  elements.zoomStart.addEventListener('change', render);
-  elements.zoomEnd.addEventListener('change', render);
+  elements.zoomStart.addEventListener('change', () => { clearTimeout(zoomSettleTimer); render(); });
+  elements.zoomEnd.addEventListener('change', () => { clearTimeout(zoomSettleTimer); render(); });
   [elements.zoomStart, elements.zoomEnd].forEach((handle) => {
     handle.addEventListener('pointerdown', () => handle.classList.add('active'));
     handle.addEventListener('pointerup', () => handle.classList.remove('active'));
@@ -525,7 +540,7 @@
   window.addEventListener('resize', debounce(renderTimeline, 120));
   function debounce(fn, wait) { let timeout; return () => { clearTimeout(timeout); timeout = setTimeout(fn, wait); }; }
 
-  $('#hero-count').textContent = fmt.format(data.people.length);
+  $('#hero-count').textContent = fmt.format(totalPeople);
   [elements.zoomStart, elements.zoomEnd].forEach((handle) => {
     handle.min = FULL_YEAR_MIN; handle.max = FULL_YEAR_MAX; handle.step = 1;
   });

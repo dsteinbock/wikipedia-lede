@@ -3,25 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Explore people whose recorded lifespan intersects age 27.">
-  <title>27ish Club — an age 27 data atlas</title>
-  <link rel="stylesheet" href="styles.css">
+  <meta name="description" content="Explore people whose recorded lives ended at 27-ish — history’s most infamous club.">
+  <title>27ish Club — Wikipedia’s least cheerful birthday list</title>
+  <link rel="icon" href="favicon.svg?v=2" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css?v=17">
 </head>
 <body>
-  <header class="masthead">
-    <a class="wordmark" href="#top" aria-label="27ish Club home">
-      <span class="wordmark-number">27</span>
-      <span class="wordmark-copy">27ish<br>Club</span>
-    </a>
-    <p class="masthead-note">A statistically awkward number of people who never had to worry about turning 30.</p>
-  </header>
-
   <main id="top">
     <section class="hero" aria-labelledby="page-title">
       <div class="hero-copy">
-        <p class="eyebrow">Wikidata’s least cheerful birthday list</p>
-        <h1 id="page-title"><span>27ish</span><br><em>Club.</em></h1>
-        <p class="hero-deck">Explore <strong id="hero-count">2,956</strong> records of people who stopped updating early. History is long. Their twenties were, statistically speaking, a limited series.</p>
+        <p class="eyebrow">Wikipedia’s least cheerful birthday list</p>
+        <h1 id="page-title"><span class="title-number">27</span><em class="title-ish">ish</em><br><em class="title-word">Club</em></h1>
+        <p class="hero-deck">Explore <strong id="hero-count" aria-live="polite"></strong> people whose recorded lives ended at 27-<em>ish</em> — history’s most infamous club.</p>
       </div>
       <div class="hero-orbit" aria-hidden="true">
         <div class="orbit orbit-one"></div>
@@ -40,10 +33,9 @@
     <section class="explorer" aria-labelledby="explorer-title">
       <div class="section-heading">
         <div>
-          <p class="eyebrow">The dearly data-parted</p>
+          <p class="eyebrow">The dearly departed data</p>
           <h2 id="explorer-title">Everybody dies.<br>These people had timing.</h2>
         </div>
-        <button class="reset-button" id="reset-filters" type="button">Reset filters</button>
       </div>
 
       <div class="filter-deck" aria-label="Dataset filters">
@@ -81,6 +73,9 @@
           <input id="search" type="search" placeholder="Name, identity, cause, manner or QID…" autocomplete="off">
         </label>
       </div>
+      <div class="filter-actions">
+        <button class="reset-button" id="reset-filters" type="button">Reset filters</button>
+      </div>
 
       <div class="result-ribbon" aria-live="polite">
         <span class="result-number" id="result-count">2,956</span>
@@ -92,8 +87,8 @@
         <article class="viz-panel timeline-panel">
           <div class="panel-heading">
             <div>
-              <p class="panel-kicker">The main event, chronologically</p>
-              <h3>The point of no return</h3>
+              <p class="panel-kicker">Timeline</p>
+              <h3>Recorded deaths by year</h3>
             </div>
             <p id="timeline-note">Each dot is one person, placed at their exact recorded year of death</p>
           </div>
@@ -126,24 +121,6 @@
       </div>
 
       <div class="support-grid">
-        <article class="viz-panel status-panel">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Cause of classification</p>
-              <h3>Dead certain-ish</h3>
-            </div>
-          </div>
-          <div class="donut-layout">
-            <div class="donut" id="status-donut" role="img" aria-label="Classification breakdown">
-              <div class="donut-core"><strong id="confirmed-pct">52%</strong><span>confirmed</span></div>
-            </div>
-            <dl class="status-legend">
-              <div><dt><i class="legend-dot confirmed-dot"></i>Confirmed</dt><dd id="confirmed-count">1,549</dd></div>
-              <div><dt><i class="legend-dot possible-dot"></i>Possible</dt><dd id="possible-count">1,407</dd></div>
-            </dl>
-          </div>
-        </article>
-
         <article class="viz-panel occupations-panel">
           <div class="panel-heading">
             <div>
@@ -158,10 +135,7 @@
 
       <section class="record-section" aria-labelledby="records-title">
         <div class="record-heading">
-          <div>
-            <p class="eyebrow">Roll call for the permanently unavailable</p>
-            <h2 id="records-title">The guest list</h2>
-          </div>
+          <div><h2 id="records-title">Members list</h2></div>
           <label class="sort-field">Sort
             <select id="sort-order">
               <option value="death-asc">Death date: oldest first</option>
@@ -187,12 +161,11 @@
   </dialog>
 
   <footer>
-    <div class="footer-27">27</div>
-    <p>Dates are structured. Mortality remains stubbornly unstructured. “Possible” reflects fuzzy source dates, not a séance with the editorial board.</p>
+    <div class="footer-wordmark" aria-label="27ish Club"><span>27</span><em>ish</em><br><em>Club</em></div>
     <a href="#top">Back to top ↑</a>
   </footer>
 
-  <script src="data.js"></script>
-  <script src="app.js?v=11"></script>
+  <script src="data.js?v=13"></script>
+  <script src="app.js?v=17"></script>
 </body>
 </html>
