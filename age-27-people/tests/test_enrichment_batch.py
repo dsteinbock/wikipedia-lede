@@ -1780,6 +1780,7 @@ class RefillableSchedulerTests(unittest.TestCase):
             self.assertEqual(status["ready_counts"]["eligibility"], 0)
             self.assertEqual(status["processing_remaining"], 0)
             self.assertTrue(status["processing_complete"])
+            self.assertEqual(status["completion_scope"], "frozen_cohort_only")
 
     def test_completion_preserves_valid_partial_results_and_rejects_extras(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1818,6 +1819,87 @@ class RefillableSchedulerTests(unittest.TestCase):
             self.assertEqual(result["rejected_extra_keys"], ["Q999"])
             self.assertTrue(batch.semantic_artifact_path(run_dir, "eligibility", "Q1").exists())
             self.assertFalse(batch.semantic_artifact_path(run_dir, "eligibility", "Q999").exists())
+
+    def test_exception_review_links_names_sorts_fields_and_keeps_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            rows = [
+                blank_row("Q1", "Zulu", "2024"),
+                blank_row("Q2", "Alpha", "2024"),
+            ]
+            write_csv(people, TEST_COLUMNS, rows)
+            run_dir = root / "run"
+            batch.create_cohort(
+                people_csv=people, cache_root=root / "cache", batch_size=None, run_dir=run_dir
+            )
+            batch.atomic_write_json(
+                run_dir / "scheduler" / "exceptions.json",
+                {
+                    "vocabulary:occupation:zulu": {
+                        "task_key": "vocabulary:occupation:zulu",
+                        "role": "vocabulary",
+                        "key": "occupation:zulu",
+                        "reason": "No direct occupation item.",
+                        "affected_qids": ["Q1"],
+                    },
+                    "vocabulary:cause:alpha": {
+                        "task_key": "vocabulary:cause:alpha",
+                        "role": "vocabulary",
+                        "key": "cause:alpha",
+                        "reason": "No direct cause item.",
+                        "affected_qids": ["Q2"],
+                    },
+                },
+            )
+            candidates = root / "candidate-proposals.json"
+            batch.atomic_write_json(
+                candidates,
+                {
+                    "schema_version": 1,
+                    "rows": [
+                        {
+                            "exception_key": "vocabulary:occupation:zulu",
+                            "qid": "Q1",
+                            "name": "Zulu",
+                            "wikipedia_url": rows[0]["wikipedia_url"],
+                            "field": "occupation",
+                            "label": "zulu",
+                            "reason": "No direct occupation item.",
+                            "proposed_mappings": [
+                                {"label": "artist", "qid": "Q1", "rationale": "Review candidate."}
+                            ],
+                        },
+                        {
+                            "exception_key": "vocabulary:cause:alpha",
+                            "qid": "Q2",
+                            "name": "Alpha",
+                            "wikipedia_url": rows[1]["wikipedia_url"],
+                            "field": "cause",
+                            "label": "alpha",
+                            "reason": "No direct cause item.",
+                            "proposed_mappings": [
+                                {"label": "injury", "qid": "Q2", "rationale": "Review candidate."}
+                            ],
+                        },
+                    ],
+                },
+            )
+            output = root / "exception-review.json"
+            result = batch.prepare_exception_review(
+                cohort_value=run_dir,
+                tranche=1,
+                candidate_proposals=candidates,
+                staged_people_csv=people,
+                output=output,
+            )
+            self.assertEqual(result["rows"], 2)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual([item["field"] for item in payload["rows"]], ["cause", "occupation"])
+            markdown = output.with_suffix(".md").read_text(encoding="utf-8")
+            self.assertIn("[Alpha](https://en.wikipedia.org/wiki/Alpha)", markdown)
+            self.assertIn("[Q1](https://www.wikidata.org/wiki/Q1)", markdown)
+            self.assertNotIn("| Wikipedia |", markdown)
 
     def test_tranche_approval_hash_detects_post_review_changes(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -2138,6 +2138,7 @@ def scheduler_status(*, cohort_value: Path) -> dict[str, Any]:
         "processing_complete": (
             not processing_remaining and not state["active_leases"]
         ),
+        "completion_scope": "frozen_cohort_only",
     }
 
 
@@ -2167,7 +2168,28 @@ def claim_assignment(
     status = scheduler_status(cohort_value=cohort_value)
     ready = status["ready_items"]
     active_roles = {lease["role"] for lease in state["active_leases"].values()}
-    if ready["eligibility"] and "eligibility" not in active_roles:
+    # Finish the earliest still-open approval tranche when its identity work
+    # is ready.  Identity is normally downstream of the reserved eligibility
+    # lane, but leaving a tranche's final identity rows behind a large global
+    # eligibility backlog makes that tranche appear permanently stalled.
+    pending_tranches = [
+        item["tranche"] for item in status["tranches"] if not item["reviewable"]
+    ]
+    earliest_pending_tranche = min(pending_tranches) if pending_tranches else None
+    tranche_by_qid = {
+        person["wikidata_id"]: int(person.get("approval_tranche", 1))
+        for person in cohort["selected"]
+    }
+    priority_identity_ready = (
+        earliest_pending_tranche is not None
+        and any(
+            tranche_by_qid.get(qid) == earliest_pending_tranche
+            for qid in ready["identity"]
+        )
+    )
+    if priority_identity_ready:
+        role = "identity"
+    elif ready["eligibility"] and "eligibility" not in active_roles:
         role = "eligibility"
     else:
         priority = (
@@ -3146,7 +3168,19 @@ def _validate_article_eligibility(
                 "no_dedicated_person_article"
             ]:
                 raise BatchError(f"{qid}: stay override does not replace the removal reasons")
-        if chosen["subject_match"] != "match" or chosen["subject_is_human"] == "nonhuman":
+        # The approved-musician/archived-27-club stay is deliberately allowed
+        # to retain a named member whose English sitelink redirects to the
+        # group article.  The redirect remains visible in the review; the
+        # override is the explicit provenance for treating it as eligible.
+        stay_subject_override = (
+            set(stay_overrides)
+            == {"approved_musician_occupation", "archived_27_club_article"}
+            and qid in _load_approved_musician_qids()
+        )
+        if (
+            (chosen["subject_match"] != "match" or chosen["subject_is_human"] == "nonhuman")
+            and not stay_subject_override
+        ):
             raise BatchError(f"{qid}: selected article is not a matching human subject")
         if chosen["life_status"] in {"living", "conflicting"}:
             raise BatchError(f"{qid}: selected article has a living-status conflict")
@@ -4041,6 +4075,17 @@ def prepare_tranche_review(
             for item in status["exceptions"]
         }
     )
+    # Corrections are tied to an already-reviewed item and are not Part 2
+    # vocabulary/semantic exceptions.  Keep them out of the exception-review
+    # coverage set; they remain durable lane entries and are handled by the
+    # correction workflow separately.
+    exception_review_qids = _exception_qids(
+        {
+            str(item["task_key"]): item
+            for item in status["exceptions"]
+            if item.get("role") in {*SEMANTIC_ROLES, "vocabulary"}
+        }
+    )
     migrated_qids: set[str] = set()
     for migration_path in sorted((run_dir / "scheduler" / "migrations").glob("*.json")):
         migration = json.loads(migration_path.read_text(encoding="utf-8"))
@@ -4067,7 +4112,7 @@ def prepare_tranche_review(
         "cohort_hash": cohort["cohort_hash"],
         "tranche": tranche,
         "qids": qids,
-        "exceptions_excluded": sorted(exception_qids & {
+        "exceptions_excluded": sorted(exception_review_qids & {
             person["wikidata_id"]
             for person in cohort["selected"]
             if int(person.get("approval_tranche", 1)) == tranche
@@ -4089,6 +4134,134 @@ def prepare_tranche_review(
         sequence += 1
     atomic_write_json(path, manifest)
     return {"review_manifest": str(path), **manifest}
+
+
+def prepare_exception_review(
+    *,
+    cohort_value: Path,
+    tranche: int,
+    candidate_proposals: Path,
+    staged_people_csv: Path,
+    output: Path | None = None,
+) -> dict[str, Any]:
+    """Freeze a separate, candidate-backed review for tranche exceptions."""
+    run_dir, cohort = cohort_paths(cohort_value)
+    people_fields, people_rows = read_csv(staged_people_csv)
+    del people_fields
+    people_by_qid = {row["wikidata_id"]: row for row in people_rows}
+    tranche_qids = {
+        person["wikidata_id"]
+        for person in cohort["selected"]
+        if int(person.get("approval_tranche", 1)) == tranche
+    }
+    exceptions = _scheduler_exceptions(run_dir)
+    candidate_value = json.loads(candidate_proposals.read_text(encoding="utf-8"))
+    candidate_rows = candidate_value.get("rows") if isinstance(candidate_value, dict) else candidate_value
+    if not isinstance(candidate_rows, list):
+        raise BatchError("Exception candidate proposals must contain a rows array")
+    by_key = {}
+    for item in candidate_rows:
+        if not isinstance(item, dict):
+            raise BatchError("Malformed exception candidate proposal")
+        key = (str(item.get("exception_key", "")), str(item.get("qid", "")))
+        if key in by_key:
+            raise BatchError(f"Duplicate exception candidate proposal: {key[0]}:{key[1]}")
+        by_key[key] = item
+
+    rows: list[dict[str, Any]] = []
+    for task_key, exception in exceptions.items():
+        role = str(exception.get("role", ""))
+        if role not in {*SEMANTIC_ROLES, "vocabulary"}:
+            continue
+        affected = [
+            qid for qid in exception.get("affected_qids", []) if qid in tranche_qids
+        ]
+        if not affected and role in SEMANTIC_ROLES and exception.get("key") in tranche_qids:
+            affected = [str(exception["key"])]
+        for qid in affected:
+            person = people_by_qid.get(qid)
+            if person is None:
+                raise BatchError(f"Exception QID missing from staged people CSV: {qid}")
+            proposed = by_key.get((task_key, qid))
+            if proposed is None:
+                raise BatchError(f"Missing candidate proposal for {task_key}:{qid}")
+            field = str(exception.get("field", ""))
+            label = str(exception.get("label", ""))
+            if role == "vocabulary" and (not field or not label):
+                prefix, _, suffix = str(exception.get("key", "")).partition(":")
+                field, label = prefix, suffix
+            rows.append(
+                {
+                    "exception_key": task_key,
+                    "qid": qid,
+                    "name": person["name"],
+                    "wikipedia_url": person["wikipedia_url"],
+                    "field": field or role,
+                    "label": label,
+                    "reason": str(exception.get("reason", "")),
+                    "proposed_mappings": proposed.get("proposed_mappings", []),
+                }
+            )
+    rows.sort(key=lambda item: (item["field"].casefold(), item["name"].casefold(), item["qid"]))
+    payload = {
+        "schema_version": 1,
+        "cohort_hash": cohort["cohort_hash"],
+        "tranche": tranche,
+        "rows": rows,
+    }
+    review_hash = hashlib.sha256(canonical_json(payload).encode()).hexdigest()
+    manifest = {**payload, "review_hash": review_hash, "prepared_utc": utc_now()}
+    if output is None:
+        output = run_dir / "scheduler" / "reviews" / f"tranche-{tranche:03d}-exceptions.json"
+    atomic_write_json(output, manifest)
+
+    def markdown_cell(value: Any) -> str:
+        return str(value or "").replace("|", "\\|").replace("\n", " ")
+
+    markdown_rows = [
+        "# Tranche exception review",
+        "",
+        f"Review hash: `{review_hash}`",
+        "",
+        "| Name (Wikipedia link) | Problematic field | Original label | Reason | Proposed mappings |",
+        "|---|---|---|---|---|",
+    ]
+    for item in rows:
+        mapping_text = []
+        for mapping in item["proposed_mappings"]:
+            qid = str(mapping.get("qid", "")).strip()
+            qid_display = (
+                f"[{qid}](https://www.wikidata.org/wiki/{qid})"
+                if QID_RE.fullmatch(qid)
+                else "QID lookup needed"
+            )
+            mapping_text.append(
+                f"{mapping.get('label', '')} ({qid_display}): {mapping.get('rationale', '')}"
+            )
+        mappings = "; ".join(mapping_text)
+        linked_name = f"[{item['name']}]({item['wikipedia_url']})"
+        markdown_rows.append(
+            "| "
+            + " | ".join(
+                markdown_cell(value)
+                for value in (
+                    linked_name,
+                    item["field"],
+                    item["label"],
+                    item["reason"],
+                    mappings,
+                )
+            )
+            + " |"
+        )
+    markdown_path = output.with_suffix(".md")
+    markdown_path.write_text("\n".join(markdown_rows) + "\n", encoding="utf-8")
+    return {
+        "exception_review": str(output),
+        "markdown": str(markdown_path),
+        "review_hash": review_hash,
+        "rows": len(rows),
+    }
 
 
 def queue_review_correction(
@@ -4149,6 +4322,26 @@ def record_tranche_approval(*, review_manifest: Path, reviewed_hash: str) -> Pat
     review = json.loads(review_manifest.read_text(encoding="utf-8"))
     if review.get("schema_version") != 1 or reviewed_hash != review.get("review_hash"):
         raise BatchError("Approval hash does not match the reviewed tranche")
+    exception_qids = set(review.get("exceptions_excluded", []))
+    if exception_qids:
+        exception_review_path = review_manifest.with_name(
+            review_manifest.stem + "-exceptions.json"
+        )
+        if not exception_review_path.exists():
+            raise BatchError(
+                "Exception review is required before approving a tranche with exclusions"
+            )
+        exception_review = json.loads(exception_review_path.read_text(encoding="utf-8"))
+        reviewed_exception_qids = {
+            str(item.get("qid", "")) for item in exception_review.get("rows", [])
+        }
+        if (
+            exception_review.get("schema_version") != 1
+            or exception_review.get("cohort_hash") != review.get("cohort_hash")
+            or int(exception_review.get("tranche", -1)) != int(review.get("tranche", -2))
+            or reviewed_exception_qids != exception_qids
+        ):
+            raise BatchError("Exception review does not match the tranche exclusions")
     path = review_manifest.with_name(review_manifest.stem + "-approval.json")
     if path.exists():
         raise BatchError(f"Approval already exists: {path}")
@@ -4822,6 +5015,16 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_review.add_argument("--staged-people-csv", type=Path, required=True)
     prepare_review.add_argument("--staged-review-csv", type=Path, required=True)
 
+    exception_review = subparsers.add_parser(
+        "prepare-exception-review",
+        help="Freeze a candidate-backed review for tranche exceptions",
+    )
+    exception_review.add_argument("--cohort", type=Path, required=True)
+    exception_review.add_argument("--tranche", type=int, required=True)
+    exception_review.add_argument("--candidate-proposals", type=Path, required=True)
+    exception_review.add_argument("--staged-people-csv", type=Path, required=True)
+    exception_review.add_argument("--output", type=Path)
+
     approve_review = subparsers.add_parser(
         "record-tranche-approval",
         help="Record the exact reviewed hash after explicit user approval",
@@ -5140,6 +5343,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                         proposals_path=args.proposals,
                         staged_people_csv=args.staged_people_csv,
                         staged_review_csv=args.staged_review_csv,
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.command == "prepare-exception-review":
+            print(
+                json.dumps(
+                    prepare_exception_review(
+                        cohort_value=args.cohort,
+                        tranche=args.tranche,
+                        candidate_proposals=args.candidate_proposals,
+                        staged_people_csv=args.staged_people_csv,
+                        output=args.output,
                     ),
                     indent=2,
                 )

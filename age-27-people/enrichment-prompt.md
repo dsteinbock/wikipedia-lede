@@ -1,7 +1,8 @@
 # Deterministic refillable-slot Wikipedia enrichment workflow
 
-Process one frozen queue and stop. Use `age-27-people/enrichment_batch.py` for
-every deterministic action. `--all-eligible` is the standard selection mode;
+Process the live eligible queue through one or more frozen cohorts. Use
+`age-27-people/enrichment_batch.py` for every deterministic action.
+`--all-eligible` is the standard selection mode;
 `--batch-size N` remains available for bounded compatibility runs and is
 mutually exclusive with it.
 
@@ -22,7 +23,10 @@ mutually exclusive with it.
 
 ## Queue initialization
 
-Copy live people/review files to the staged paths once. Run status, then:
+Copy live people/review files to the staged paths once. Resume a `RUN_DIR` only
+when the user explicitly supplied it; never infer the active run from an old
+cache directory. Run `status --limit 0`, then, when its eligible count is
+nonzero:
 
 ```sh
 python age-27-people/enrichment_batch.py --people-csv "$TEST_OUTPUT_CSV" select --all-eligible
@@ -114,7 +118,10 @@ or correction requires a catch-up review/approval.
 
 Report queue/tranche counts, active leases, assignment input bytes, attempts,
 exceptions, semantic status counts, vocabulary results, retrieval metrics,
-tests, approvals, migrations, staged/live paths, and wall time. Finish only
-when `scheduler-status` reports `processing_remaining: 0` and
-`processing_complete: true`, meaning every frozen QID is migrated or explicitly
-in the exception lane and no lease remains.
+tests, approvals, migrations, staged/live paths, and wall time.
+`processing_complete: true` is frozen-cohort-only. After each cohort reaches it,
+run live `status --limit 0` again in the original scope. If eligible rows remain
+above the number of distinct QIDs in that cohort's durable exception/correction
+lane, create a fresh `select --all-eligible` cohort immediately and continue.
+Finish only when the remaining count equals the durable lane count and no lease
+or unapproved reviewable tranche remains.
