@@ -8,6 +8,7 @@
     const match = String(value).match(/^-?\d{1,6}/);
     return match ? Number(match[0]) : 0;
   };
+  const isKnownValue = (value) => Boolean(value) && !['unknown', 'somevalue'].includes(String(value).toLocaleLowerCase());
   const deathSortValue = (value) => {
     const match = String(value).match(/^(-?\d{1,6})(?:-(\d{2}))?(?:-(\d{2}))?/);
     if (!match) return 0;
@@ -340,9 +341,10 @@
 
   function renderRecords() {
     const visible = filtered.slice(0, state.shown);
-    const listValues = (values) => {
-      const known = values.filter((value) => value && value.toLocaleLowerCase() !== 'unknown');
-      return known.length ? known.map(escapeHtml).join(' · ') : 'Unknown';
+    const deathSummary = (row) => {
+      const cause = row.c.filter(isKnownValue).map(escapeHtml).join(' · ');
+      const manner = row.m.filter(isKnownValue).map(escapeHtml).join(' · ');
+      return [cause, manner].filter(Boolean).join(', ') || 'unknown';
     };
     elements.list.innerHTML = visible.map((row) => `
       <div class="record-row">
@@ -350,8 +352,7 @@
           <span class="record-index"></span>
           <span class="record-name"><strong>${escapeHtml(row.n)}</strong><small>${row.q}${musicianIds.has(row.q) ? ' · musician' : ''}</small></span>
           <span class="record-lived"><small>Lived</small><br>${escapeHtml(row.b)} — ${escapeHtml(row.d)}</span>
-          <span class="record-fact"><small>Cause of death</small><br>${listValues(row.c)}</span>
-          <span class="record-fact"><small>Manner of death</small><br>${listValues(row.m)}</span>
+          <span class="record-fact"><small>Cause of Death</small><br>${deathSummary(row)}</span>
           <span class="record-occupations">${row.o.slice(0, 2).map((occupation) => `<i class="occupation-tag" style="--occupation-color:${occupationColor(occupation)}">${escapeHtml(occupation)}</i>`).join('') || '<i class="occupation-tag">unclassified</i>'}</span>
           <span class="status-icon ${row.s}" role="img" aria-label="${row.s === 'confirmed' ? 'Confirmed age 27' : 'Possibly age 27'}" data-tooltip="${row.s === 'confirmed' ? 'Confirmed age 27' : 'Possibly age 27'}">${row.s === 'confirmed' ? '✓' : '≈'}</span>
         </button>
@@ -366,13 +367,13 @@
   function openDetail(row) {
     if (!row) return;
     const isMusician = musicianIds.has(row.q);
-    const hasKnownValues = (values) => values.some((value) => value && value.toLocaleLowerCase() !== 'unknown');
+    const hasKnownValues = (values) => values.some(isKnownValue);
     const hasWikipediaFallback = (row.wc && hasKnownValues(row.c)) || (row.wm && hasKnownValues(row.m)) || (row.wo && hasKnownValues(row.o));
     const detailDate = (value) => value
       ? `${escapeHtml(value)}<sup title="Wikidata">1</sup>`
       : 'Unknown';
     const detailValues = (values, wikipediaDerived) => {
-      const known = values.filter((value) => value && value.toLocaleLowerCase() !== 'unknown');
+      const known = values.filter(isKnownValue);
       if (!known.length) return 'Unknown';
       const sourceNumber = wikipediaDerived ? 2 : 1;
       const sourceTitle = wikipediaDerived ? 'English Wikipedia-derived fallback' : 'Wikidata';
@@ -382,10 +383,9 @@
     elements.dialogContent.innerHTML = `
       <div class="detail-hero"><p class="eyebrow">${row.q}${isMusician ? ' · musician collection' : ''}</p><h2>${escapeHtml(row.n)}</h2></div>
       <div class="detail-body">
-        <div class="detail-dates"><div><span>Arrived</span><strong>${detailDate(row.b)}</strong></div><div><span>Departed early</span><strong>${detailDate(row.d)}</strong></div></div>
+        <div class="detail-dates"><div><span>Arrived</span><strong>${detailDate(row.b)}</strong></div><div><span>Departed</span><strong>${detailDate(row.d)}</strong></div></div>
         <div class="detail-fact"><span>How sure are we?</span><strong class="status-tag ${row.s}">${row.s}</strong></div>
-        <div class="detail-fact"><span>Possible age range</span><strong>${escapeHtml(row.r)}</strong></div>
-        <div class="detail-fact"><span>Total runtime</span><strong>${fmt.format(row.lo)}–${fmt.format(row.hi)} days</strong></div>
+        <div class="detail-fact"><span>Age at Death</span><strong>${escapeHtml(row.r)}</strong></div>
         <div class="detail-fact"><span>Cause of death</span><strong>${detailValues(row.c, row.wc)}</strong></div>
         <div class="detail-fact"><span>Manner of death</span><strong>${detailValues(row.m, row.wm)}</strong></div>
         <div class="detail-fact"><span>Primary identity</span><strong>${detailValues(row.o, row.wo)}</strong></div>
