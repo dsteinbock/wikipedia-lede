@@ -60,3 +60,22 @@ class DescriptionRefreshTests(unittest.TestCase):
                 reader = csv.DictReader(handle)
                 self.assertEqual(reader.fieldnames, refresh_descriptions.CSV_COLUMNS)
                 self.assertEqual(next(reader)["description"], "A person")
+
+    def test_normalizes_trailing_lifespan_and_death_year_without_erasing_other_dates(self):
+        normalize = refresh_descriptions.normalize_description
+        self.assertEqual(
+            normalize("Ugandan footballer (1998–2026).", "1998", "2026-01-05"),
+            "Ugandan footballer",
+        )
+        self.assertEqual(
+            normalize("English politician, died 1606", "1578", "1606"),
+            "English politician",
+        )
+        self.assertEqual(
+            normalize("14th Sultan of the Ottoman Empire (1603–1617)", "1590", "1617"),
+            "14th Sultan of the Ottoman Empire (1603–1617)",
+        )
+        self.assertEqual(
+            normalize("Landowner in Devon.", "1800", "1827"),
+            "Landowner in Devon",
+        )

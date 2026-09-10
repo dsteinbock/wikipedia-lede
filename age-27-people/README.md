@@ -18,6 +18,8 @@ To refresh only the English Wikidata descriptions for the existing public cohort
 python age-27-people/refresh_descriptions.py
 ```
 
+To apply only the same date-suffix and trailing-punctuation cleanup to descriptions already in the CSV, without querying Wikidata again, add `--normalize-existing`.
+
 Candidate discovery uses bounded Wikidata Query Service ranges. Name, English description, English Wikipedia sitelink, direct occupation labels, cause of death, and manner of death are fetched in batches of 50 through Wikibase GraphQL.
 
 The CSV distinguishes Wikidata's specific [`cause of death` (`P509`)](https://www.wikidata.org/wiki/Property:P509) from its broad [`manner of death` (`P1196`)](https://www.wikidata.org/wiki/Property:P1196). Multiple best-ranked values are alphabetized and separated by semicolons. A blank value means Wikidata has no usable best-ranked item statement for that field; it is not an inference that the cause or manner is unknown in other sources.
