@@ -158,11 +158,13 @@ class EnrichmentTests(unittest.TestCase):
 
             @staticmethod
             def assertions(query):
+                assert 'description(languageCode: "en")' in query
                 assert 'statements(propertyId: "P509")' in query
                 assert 'statements(propertyId: "P1196")' in query
 
         people = {"Q1": RawPerson("Q1")}
         people27.enrich_people(Client(), people)
+        self.assertEqual(people["Q1"].description, "")
         self.assertEqual(people["Q1"].causes_of_death, {"Alpha cause", "Zeta cause"})
         self.assertEqual(people["Q1"].manners_of_death, {"Q20"})
 

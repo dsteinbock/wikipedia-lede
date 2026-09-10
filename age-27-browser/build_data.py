@@ -43,6 +43,7 @@ def load(relative_path: str, occupation_column: str) -> list[dict[str, object]]:
             rows.append(
                 {
                     "n": row["name"],
+                    "x": row.get("description", ""),
                     "u": row["wikipedia_url"],
                     "q": row["wikidata_id"],
                     "b": row["birth_date"],

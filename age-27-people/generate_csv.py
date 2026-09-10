@@ -184,6 +184,7 @@ query age27People {{
   itemsById(ids: [{ids}]) {{
     id
     label(languageCode: "en")
+    description(languageCode: "en")
     sitelink(siteId: "enwiki") {{ title url }}
     occupations: statements(propertyId: "P106") {{
       rank
@@ -241,6 +242,7 @@ def enrich_people(client: GraphQLClient, people: Mapping[str, RawPerson]) -> dic
                 raise DataValidationError(f"Missing English Wikipedia sitelink for {qid}")
             person = people[qid]
             person.name = item.get("label") or sitelink.get("title") or qid
+            person.description = item.get("description") or ""
             person.wikipedia_url = sitelink["url"]
             occupation_ids, labels = _best_occupation_labels(item.get("occupations") or [])
             person.occupations = occupation_ids
@@ -280,6 +282,7 @@ def build_rows(
         rows.append(
             {
                 "name": person.name,
+                "description": person.description,
                 "wikipedia_url": person.wikipedia_url,
                 "wikidata_id": qid,
                 "birth_date": "; ".join(

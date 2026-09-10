@@ -12,7 +12,13 @@ python age-27-people/generate_csv.py
 
 The complete run queries Wikidata serially, caches every successful death-year shard and enrichment batch under the ignored `age-27-people/.cache/` directory, and resumes from that cache after interruption. The final artifact is [`age_27_people.csv`](age_27_people.csv), sorted by earliest possible death date ascending.
 
-Candidate discovery uses bounded Wikidata Query Service ranges. Name, English Wikipedia sitelink, direct occupation labels, cause of death, and manner of death are fetched in batches of 50 through Wikibase GraphQL.
+To refresh only the English Wikidata descriptions for the existing public cohort, without changing membership selection, run:
+
+```sh
+python age-27-people/refresh_descriptions.py
+```
+
+Candidate discovery uses bounded Wikidata Query Service ranges. Name, English description, English Wikipedia sitelink, direct occupation labels, cause of death, and manner of death are fetched in batches of 50 through Wikibase GraphQL.
 
 The CSV distinguishes Wikidata's specific [`cause of death` (`P509`)](https://www.wikidata.org/wiki/Property:P509) from its broad [`manner of death` (`P1196`)](https://www.wikidata.org/wiki/Property:P1196). Multiple best-ranked values are alphabetized and separated by semicolons. A blank value means Wikidata has no usable best-ranked item statement for that field; it is not an inference that the cause or manner is unknown in other sources.
 

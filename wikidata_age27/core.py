@@ -13,6 +13,7 @@ SUPPORTED_CALENDARS = {GREGORIAN, JULIAN}
 
 CSV_BASE_COLUMNS = [
     "name",
+    "description",
     "wikipedia_url",
     "wikidata_id",
     "birth_date",
@@ -111,6 +112,7 @@ class StructuredTime:
 class RawPerson:
     qid: str
     name: str = ""
+    description: str = ""
     wikipedia_url: str = ""
     births: set[StructuredTime] = field(default_factory=set)
     deaths: set[StructuredTime] = field(default_factory=set)
