@@ -3020,5 +3020,91 @@ class AmbiguousMemberReviewTests(unittest.TestCase):
             self.assertTrue(status["tranches"][0]["reviewable"])
 
 
+class ApplyAmbiguousRecommendationsTests(unittest.TestCase):
+    def _person(self, qid, status="possible"):
+        row = {column: "" for column in [
+            "name", "description", "wikipedia_url", "wikidata_id", "birth_date",
+            "death_date", "cause_of_death", "manner_of_death", "age_status",
+            "minimum_lifespan_days", "maximum_lifespan_days", "possible_age_range",
+            "occupations", *batch.FALLBACK_COLUMNS,
+        ]}
+        row.update({
+            "name": qid, "wikipedia_url": f"https://en.wikipedia.org/wiki/{qid}",
+            "wikidata_id": qid, "birth_date": "2000", "death_date": "2027",
+            "age_status": status, "minimum_lifespan_days": "9498",
+            "maximum_lifespan_days": "10226",
+            "possible_age_range": "26 years, 1 day to 28 years, 0 days",
+        })
+        return row
+
+    def _review(self, person, action, **values):
+        row = {column: "" for column in batch.AMBIGUOUS_REVIEW_COLUMNS}
+        row.update({
+            "wikidata_id": person["wikidata_id"], "name": person["name"],
+            "article_url": person["wikipedia_url"], "revision_id": "1",
+            "member_classes": "possible", "existing_age_status": person["age_status"],
+            "wikidata_birth_dates": person["birth_date"],
+            "wikidata_death_dates": person["death_date"],
+            "source_row_sha256": batch._ambiguous_source_row_sha256(person),
+            "recommended_action": action, "reason": "test recommendation",
+            "reviewed_utc": batch.utc_now(), "source_run_dir": "test-run",
+        })
+        row.update(values)
+        return row
+
+    def test_applies_actions_and_rejects_stale_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            musicians = root / "musicians.csv"
+            review = root / "review.csv"
+            removed = root / "removed.csv"
+            rows = [self._person(f"Q{index}") for index in range(1, 6)]
+            write_csv(people, list(rows[0]), rows)
+            musician_fields = [
+                "name", "wikipedia_url", "wikidata_id", "birth_date", "death_date",
+                "cause_of_death", "manner_of_death", "age_status",
+                "minimum_lifespan_days", "maximum_lifespan_days",
+                "possible_age_range", "leaf_occupations",
+            ]
+            musician = {column: rows[1].get(column, "") for column in musician_fields}
+            musician["leaf_occupations"] = "singer"
+            write_csv(musicians, musician_fields, [musician])
+            reviews = [
+                self._review(rows[0], "discard", confirmed_age_at_death="28"),
+                self._review(rows[1], "elevate", confirmed_age_at_death="27"),
+                self._review(rows[2], "update", recommended_birth_date="2000-01-02"),
+                self._review(rows[3], "none"), self._review(rows[4], "review"),
+            ]
+            write_csv(review, batch.AMBIGUOUS_REVIEW_COLUMNS, reviews)
+            result = batch.apply_ambiguous_recommendations(
+                review_csv=review, people_csv=people, musicians_csv=musicians,
+                removed_csv=removed,
+            )
+            self.assertEqual(result["action_counts"], {
+                "discard": 1, "elevate": 1, "update": 1, "none": 1, "review": 1,
+            })
+            _, applied = batch.read_csv(people)
+            by_qid = {row["wikidata_id"]: row for row in applied}
+            self.assertNotIn("Q1", by_qid)
+            self.assertEqual(by_qid["Q2"]["age_status"], "confirmed")
+            self.assertEqual(by_qid["Q3"]["birth_date"], "2000-01-02")
+            self.assertEqual(by_qid["Q4"]["birth_date"], "2000")
+            self.assertEqual(by_qid["Q5"]["birth_date"], "2000")
+            _, musician_rows = batch.read_csv(musicians)
+            self.assertEqual(musician_rows[0]["age_status"], "confirmed")
+            _, ledger = batch.read_csv(removed)
+            self.assertEqual([row["wikidata_id"] for row in ledger], ["Q1"])
+
+            stale = self._review(by_qid["Q4"], "none")
+            stale["source_row_sha256"] = "0" * 64
+            write_csv(review, batch.AMBIGUOUS_REVIEW_COLUMNS, [stale])
+            with self.assertRaisesRegex(batch.BatchError, "source row changed"):
+                batch.apply_ambiguous_recommendations(
+                    review_csv=review, people_csv=people, musicians_csv=musicians,
+                    removed_csv=removed,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

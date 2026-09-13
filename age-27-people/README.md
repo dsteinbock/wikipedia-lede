@@ -49,6 +49,8 @@ The deterministic scanner searches explicit age wording in biographical prose, i
 
 The lane uses stable 100-member tranches and shares the global six Luna/medium slots with main enrichment. `finalize-ambiguous-tranche` upserts reportable hits into [`wikipedia_ambiguous_members_review.csv`](wikipedia_ambiguous_members_review.csv), records no-hit/false-positive completion privately, and generates a hashed Markdown review table. Recommendations are `discard`, `elevate`, `update`, `review`, or `none`. `review` is reserved for two or more conflicting singular age-at-death candidates, where either an explicit statement or one birth/death pair can supply a singular age. A range such as `aged 27–28`, an unresolved date alternative, or an ambiguous semantic hit is not singular and does not itself trigger review. `none` means the evidence establishes no membership or date action. There is no membership/data migration step because the lane is report-only.
 
+After the report has been reviewed, `apply-ambiguous-recommendations` applies its discard, elevate, and date-update decisions to the people and musician datasets.
+
 For a bounded repair, freeze the exact action-scoped rows before selection. The manifest protects every non-target report row and the original completion ledger; reuse invalidates changed excerpts, prior ambiguous decisions, and affected citation-title decisions while retaining compatible semantic work. Finalize into staged report/state copies, then use `verify-ambiguous-repair` before the guarded `publish-ambiguous-repair` operation.
 
 ```sh

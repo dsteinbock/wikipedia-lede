@@ -30,9 +30,14 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-
 PROJECT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PROJECT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from wikidata_age27.core import GREGORIAN, StructuredTime, calendar_age, format_calendar_age
+
+
 PEOPLE_CSV = PROJECT_DIR / "age_27_people.csv"
 MUSICIANS_CSV = REPO_ROOT / "age-27-musicians" / "age_27_musicians.csv"
 CLUB_ARCHIVE_HTML = REPO_ROOT / "age-27-musicians" / "purported-27-club-members.html"
@@ -7099,6 +7104,153 @@ def publish_ambiguous_repair(**kwargs: Any) -> dict[str, Any]:
     return verification
 
 
+def _structured_time_from_display(value: str) -> StructuredTime:
+    match = DATE_RE.fullmatch(value)
+    if not match:
+        raise BatchError(f"Invalid date value: {value}")
+    year = int(match.group(1))
+    month = int(match.group(2) or 1)
+    day = int(match.group(3) or 1)
+    precision = 11 if match.group(3) else 10 if match.group(2) else 9
+    raw = f"{'-' if year < 0 else '+'}{abs(year):04d}-{month:02d}-{day:02d}T00:00:00Z"
+    return StructuredTime(raw=raw, precision=precision, calendar=GREGORIAN)
+
+
+def _recalculate_age_columns(row: dict[str, str]) -> None:
+    births = [_structured_time_from_display(value) for value in split_values(row["birth_date"])]
+    deaths = [_structured_time_from_display(value) for value in split_values(row["death_date"])]
+    birth_bounds = [value.bounds() for value in births]
+    death_bounds = [value.bounds() for value in deaths]
+    if not birth_bounds or not death_bounds:
+        raise BatchError(f"{row['wikidata_id']}: birth and death dates are required")
+    earliest_birth = min((start for start, _ in birth_bounds), key=lambda value: value.to_jdn())
+    latest_birth = max((end for _, end in birth_bounds), key=lambda value: value.to_jdn())
+    earliest_death = min((start for start, _ in death_bounds), key=lambda value: value.to_jdn())
+    latest_death = max((end for _, end in death_bounds), key=lambda value: value.to_jdn())
+    minimum_days = earliest_death.to_jdn() - latest_birth.to_jdn()
+    maximum_days = latest_death.to_jdn() - earliest_birth.to_jdn()
+    if minimum_days < 0 or maximum_days < minimum_days:
+        raise BatchError(f"{row['wikidata_id']}: recommended dates permit invalid chronology")
+    minimum_age = calendar_age(latest_birth, earliest_death)
+    maximum_age = calendar_age(earliest_birth, latest_death)
+    low = format_calendar_age(*minimum_age)
+    high = format_calendar_age(*maximum_age)
+    row["minimum_lifespan_days"] = str(minimum_days)
+    row["maximum_lifespan_days"] = str(maximum_days)
+    row["possible_age_range"] = low if low == high else f"{low} to {high}"
+
+
+def apply_ambiguous_recommendations(
+    *, review_csv: Path, people_csv: Path, musicians_csv: Path, removed_csv: Path
+) -> dict[str, Any]:
+    """Apply the report's discard, elevate, and update actions to public data."""
+
+    review_fields, reviews = read_csv(review_csv)
+    if review_fields != AMBIGUOUS_REVIEW_COLUMNS:
+        raise BatchError("Ambiguous-member review schema mismatch")
+    review_qids = [row["wikidata_id"] for row in reviews]
+    if len(review_qids) != len(set(review_qids)):
+        raise BatchError("Duplicate ambiguous-member review QID")
+
+    people_fields, people_rows = read_csv(people_csv)
+    musicians_fields, musician_rows = read_csv(musicians_csv)
+    validate_public_rows(people_fields, people_rows)
+    people_by_qid = {row["wikidata_id"]: dict(row) for row in people_rows}
+    musicians_by_qid = {row["wikidata_id"]: dict(row) for row in musician_rows}
+    expected_removed_fields = removed_entry_columns(people_fields)
+    if removed_csv.exists():
+        removed_fields, removed_rows = read_csv(removed_csv)
+    else:
+        removed_fields, removed_rows = expected_removed_fields, []
+    legacy_removed_fields = [
+        column for column in expected_removed_fields if column != "description"
+    ]
+    if removed_fields == legacy_removed_fields:
+        removed_rows = [
+            {column: row.get(column, "") for column in expected_removed_fields}
+            for row in removed_rows
+        ]
+    elif removed_fields != expected_removed_fields:
+        raise BatchError(f"Removed-entry ledger schema mismatch: {removed_csv}")
+    validate_removed_entry_rows(removed_rows)
+
+    counts = {action: 0 for action in AMBIGUOUS_ACTIONS}
+    prepared: dict[str, dict[str, str]] = {}
+    for review in reviews:
+        qid = review["wikidata_id"]
+        action = review["recommended_action"]
+        if action not in AMBIGUOUS_ACTIONS:
+            raise BatchError(f"{qid}: invalid ambiguous-member action {action!r}")
+        counts[action] += 1
+        person = people_by_qid.get(qid)
+        if person is None:
+            raise BatchError(f"{qid}: review row is missing from people CSV")
+        if _ambiguous_source_row_sha256(person) != review["source_row_sha256"]:
+            raise BatchError(f"{qid}: review source row changed")
+        candidate = dict(person)
+        if action == "elevate":
+            if person["age_status"] != "possible" or review["confirmed_age_at_death"] != "27":
+                raise BatchError(f"{qid}: invalid elevate recommendation")
+            candidate["age_status"] = "confirmed"
+        elif action == "update":
+            if not review["recommended_birth_date"] and not review["recommended_death_date"]:
+                raise BatchError(f"{qid}: update recommendation has no date")
+            if review["recommended_birth_date"]:
+                candidate["birth_date"] = review["recommended_birth_date"]
+            if review["recommended_death_date"]:
+                candidate["death_date"] = review["recommended_death_date"]
+            _recalculate_age_columns(candidate)
+        prepared[qid] = candidate
+
+    removed_at = utc_now()
+    removal_qids: set[str] = set()
+    ledger_additions: list[dict[str, str]] = []
+    existing_removed = {row["wikidata_id"] for row in removed_rows}
+    for review in reviews:
+        qid = review["wikidata_id"]
+        action = review["recommended_action"]
+        person = prepared[qid]
+        if action == "discard":
+            if qid in existing_removed:
+                raise BatchError(f"{qid}: discard is already present in removed entries")
+            ledger_row = {column: people_by_qid[qid].get(column, "") for column in people_fields}
+            ledger_row.update(
+                {
+                    "removal_reason": f"ambiguous-member review: {review['reason']}",
+                    "removed_utc": removed_at,
+                    "source_run_dir": review["source_run_dir"],
+                }
+            )
+            ledger_additions.append(ledger_row)
+            removal_qids.add(qid)
+        elif action in {"elevate", "update"}:
+            people_by_qid[qid] = person
+            musician = musicians_by_qid.get(qid)
+            if musician is not None:
+                for column in (
+                    "birth_date", "death_date", "age_status", "minimum_lifespan_days",
+                    "maximum_lifespan_days", "possible_age_range",
+                ):
+                    musician[column] = person[column]
+
+    people_out = [people_by_qid[row["wikidata_id"]] for row in people_rows if row["wikidata_id"] not in removal_qids]
+    musicians_out = [musicians_by_qid[row["wikidata_id"]] for row in musician_rows if row["wikidata_id"] not in removal_qids]
+    ledger_out = removed_rows + ledger_additions
+    validate_public_rows(people_fields, people_out)
+    validate_removed_entry_rows(ledger_out)
+    if len({row["wikidata_id"] for row in musicians_out}) != len(musicians_out):
+        raise BatchError("Duplicate musician QID after ambiguous-member migration")
+
+    atomic_write_csv(people_csv, people_fields, people_out)
+    atomic_write_csv(musicians_csv, musicians_fields, musicians_out)
+    atomic_write_csv(removed_csv, removed_entry_columns(people_fields), ledger_out)
+    return {
+        "review_rows": len(reviews), "action_counts": counts,
+        "people_rows": len(people_out), "musician_rows": len(musicians_out),
+        "removed_rows": len(ledger_additions),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--people-csv", type=Path, default=PEOPLE_CSV)
@@ -7238,6 +7390,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--review-csv", type=Path, default=AMBIGUOUS_REVIEW_CSV
     )
     ambiguous_finalize.add_argument("--state", type=Path)
+
+    ambiguous_apply = subparsers.add_parser(
+        "apply-ambiguous-recommendations",
+        help="Apply discard, elevate, and update actions from the ambiguous review CSV",
+    )
+    ambiguous_apply.add_argument(
+        "--review-csv", type=Path, default=AMBIGUOUS_REVIEW_CSV
+    )
+    ambiguous_apply.add_argument("--musicians-csv", type=Path, default=MUSICIANS_CSV)
+    ambiguous_apply.add_argument("--removed-csv", type=Path, default=REMOVED_ENTRIES_CSV)
 
     for command, help_text in (
         ("verify-ambiguous-repair", "Verify a staged targeted ambiguous-member repair"),
@@ -7632,6 +7794,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                         tranche=args.tranche,
                         review_csv=args.review_csv,
                         state_path=args.state,
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.command == "apply-ambiguous-recommendations":
+            print(
+                json.dumps(
+                    apply_ambiguous_recommendations(
+                        review_csv=args.review_csv,
+                        people_csv=args.people_csv,
+                        musicians_csv=args.musicians_csv,
+                        removed_csv=args.removed_csv,
                     ),
                     indent=2,
                 )
