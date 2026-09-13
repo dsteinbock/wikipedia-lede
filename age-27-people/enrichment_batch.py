@@ -1789,13 +1789,13 @@ def _date_values_from_text(text: str, *, allow_bare_year: bool) -> list[str]:
         add(match.group(1), match.group(2), match.group(3))
     month_pattern = "|".join(sorted(MONTH_NUMBERS, key=len, reverse=True))
     for match in re.finditer(
-        rf"\b(\d{{1,2}})\s+({month_pattern})\.?\s+([+-]?\d{{3,4}})\b",
+        rf"\b(\d{{1,2}})(?:st|nd|rd|th)?(?:\s+of)?\s+({month_pattern})\.?\s+([+-]?\d{{3,4}})\b",
         text,
         flags=re.I,
     ):
         add(match.group(3), str(MONTH_NUMBERS[match.group(2).casefold()]), match.group(1))
     for match in re.finditer(
-        rf"\b({month_pattern})\.?\s+(\d{{1,2}}),?\s+([+-]?\d{{3,4}})\b",
+        rf"\b({month_pattern})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+([+-]?\d{{3,4}})\b",
         text,
         flags=re.I,
     ):

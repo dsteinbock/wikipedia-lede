@@ -2332,6 +2332,14 @@ class AmbiguousMemberReviewTests(unittest.TestCase):
 
     def test_field_date_parser_preserves_alternatives_and_uses_gregorian_conversion(self):
         self.assertEqual(
+            batch._date_values_from_field("20th November 2023", "death_date"),
+            ["2023-11-20"],
+        )
+        self.assertEqual(
+            batch._date_values_from_field("20th of November 2023", "death_date"),
+            ["2023-11-20"],
+        )
+        self.assertEqual(
             batch._date_values_from_field("1379/80", "birth_date"),
             ["1379", "1380"],
         )
