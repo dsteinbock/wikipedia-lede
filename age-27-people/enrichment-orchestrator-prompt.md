@@ -7,9 +7,9 @@ roles, batch sizes, retries, exceptions, or approval membership itself.
 
 ## Fixed execution envelope
 
-- The orchestrator occupies one environment slot. Exactly three refillable
-  semantic slots are available, numbered 1–3. Never create an intermediate
-  cohort worker.
+- The orchestrating Codex occupies one environment slot and may keep up to six
+  fresh semantic subagents active in parallel, using refillable slots numbered
+  1–6. Never create an intermediate cohort worker.
 - Use fresh Luna/medium agents. Give an agent only its immutable assignment
   manifest, its referenced prompt and inputs, and a unique output path.
 - An assignment is homogeneous by role and deterministically capped by both
@@ -41,6 +41,83 @@ manifest-scoped `target_remaining`) is nonzero, immediately freeze all of those
 currently eligible QIDs with a fresh `select --all-eligible` in the same scope.
 Run `fetch` and `packetize` serially. The frozen cohort assigns stable ordinals
 and 100-person approval tranches.
+
+## Independent ambiguous-member Wikipedia review lane
+
+Run this lane independently of death-field enrichment. An ambiguous member is
+every current live row whose `age_status` is `possible`, plus every live row
+with more than one Wikidata-derived `birth_date` or `death_date`. Main-lane
+terminal status, migration status, historical tranche membership, exception
+state, and partially completed work do not exempt a member. Therefore the
+first run backfills all 1,411 currently eligible members, including members
+already processed by the existing review system. `age_outside_26_28` remains a
+separate main-lane article-eligibility signal and is not folded into this lane.
+
+This lane is report-only. It may write
+`age-27-people/wikipedia_ambiguous_members_review.csv`, ignored cache/state, and
+frozen review artifacts. It must not change membership, dates, removals, the
+main stronger-model review CSV, browser data, or site data.
+
+Start with `ambiguous-status --limit 0`, then freeze every pending member with
+`select-ambiguous`. The ignored state ledger skips a member only when its
+current QID, name, URL, age status, birth dates, and death dates have the same
+fingerprint as its completed review. Use `--rescan-all` only for an intentional
+full rereview. Run the ordinary `fetch` and `packetize` commands against the
+new `RUN_DIR`, then run `scan-ambiguous`.
+
+The deterministic scan has two narrow purposes:
+
+- Search cleaned biographical prose for explicit age wording at any plausible
+  age, and citation `title`/`chapter` text for the narrow 26/27/28 targets.
+  Exclude URLs, reference bodies, bibliography sections, publishers, authors,
+  and other citation metadata. Preserve a range such as `aged 27–28` as one
+  non-singular range rather than two age candidates.
+- Extract common explicit birth/death date formats from the labeled infobox and
+  complete lead material, including a conventional parenthetical lifespan even
+  when a short description or image precedes the actual biographical lead. A
+  Wikipedia date is eligible only when its precision is equal to or better than
+  the best current Wikidata-derived precision for that field.
+
+A single explicit infobox age—including one deterministically rendered by a
+complete `death date and age` template—needs no semantic confirmation. Labeled
+infobox dates and role-labeled parenthetical lead lifespans also need no semantic
+confirmation. Body and citation-title age hits that still require subject/death
+context enter the narrow semantic queue.
+Give agents only the candidate excerpts produced by
+`ambiguous-role-input`; never send the full article again.
+
+Use `ambiguous-scheduler-status`, `claim-ambiguous-assignment --slot N`, and
+`complete-ambiguous-assignment` as a refillable loop. The ambiguous lane shares
+the same six numbered Luna/medium slots with the main lane: at most six
+semantic assignments may be live across both lanes, and a slot number may not
+be leased in both at once. Its byte cap is 64 KiB/20 members. Failed items get
+the same initial attempt plus two diagnosed retries, then enter this lane's
+separate exception list.
+
+When an ambiguous tranche is `reviewable`, run
+`finalize-ambiguous-tranche --tranche N`. This immediately upserts successful
+or unresolved evidence hits into the cumulative manual-review CSV and records
+no-hit/false-positive completion in ignored state; it has no migration or user
+approval step because it cannot mutate public data. Present the generated
+Markdown table and report hash. Recommended actions are deterministic:
+
+- `discard` when one singular age-at-death candidate establishes a non-27 age;
+- `elevate` when age 27 is established for a current `possible` member;
+- `update` when accepted equal-or-better Wikipedia dates improve or reduce the
+  date alternatives without changing membership status; and
+- `review` only when two or more evidence candidates establish conflicting
+  singular ages at death. An explicit singular age statement and a birth/death
+  pair that calculates one age each count as candidates; ranges, unresolved
+  date alternatives, and ambiguous semantic hits do not; and
+- `none` when the evidence establishes no membership or date action.
+
+A confirmed explicit age may select a date alternative only when exactly one
+combination remains compatible. An unresolved date alternative does not block
+an independently established membership action. Conflicts that do not produce
+a second singular age may remain recorded but do not force `review`. After every frozen
+ambiguous cohort is finalized, run live
+`ambiguous-status --limit 0` again and continue if new or changed members are
+pending.
 
 ## Refillable scheduling loop
 
@@ -103,7 +180,7 @@ approval, but no live write occurs without the exact approved manifest.
 ## Deterministic ownership
 
 The helper owns queue order, tranche membership, role readiness, byte packing,
-three-slot leases, upstream reservation, attempts, exception routing, artifact
+six-slot leases, upstream reservation, attempts, exception routing, artifact
 validation, article selection, vocabulary persistence, assembly, staging,
 review hashes, migration membership, live writes, browser rebuilds, and tests.
 The orchestrator owns only agent spawning, returning outputs, displaying review

@@ -1712,11 +1712,11 @@ class RefillableSchedulerTests(unittest.TestCase):
                 [1, 1, 2, 2, 3],
             )
 
-    def test_claims_enforce_three_slots_and_byte_capped_singletons(self):
+    def test_claims_enforce_six_slots_and_byte_capped_singletons(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             people = root / "people.csv"
-            rows = [blank_row(f"Q{index}", f"Person {index}", "2024") for index in range(1, 5)]
+            rows = [blank_row(f"Q{index}", f"Person {index}", "2024") for index in range(1, 8)]
             write_csv(people, TEST_COLUMNS, rows)
             run_dir = root / "run"
             cache = root / "cache"
@@ -1747,11 +1747,13 @@ class RefillableSchedulerTests(unittest.TestCase):
                 )
             claims = [
                 batch.claim_assignment(cohort_value=run_dir, slot=slot)
-                for slot in (1, 2, 3)
+                for slot in (1, 2, 3, 4, 5, 6)
             ]
             self.assertTrue(all(item["role"] == "eligibility" for item in claims))
             self.assertTrue(all(len(item["items"]) == 1 for item in claims))
             self.assertTrue(all(item["items"][0]["oversize_singleton"] for item in claims))
+            with self.assertRaisesRegex(batch.BatchError, "Slot must be 1..6"):
+                batch.claim_assignment(cohort_value=run_dir, slot=7)
             with self.assertRaisesRegex(batch.BatchError, "active lease"):
                 batch.claim_assignment(cohort_value=run_dir, slot=1)
 
@@ -2198,6 +2200,824 @@ class ArticleEligibilityTests(unittest.TestCase):
             self.assertEqual(
                 validated["removal_reasons"], ["no_dedicated_person_article"]
             )
+
+
+class AmbiguousMemberReviewTests(unittest.TestCase):
+    def test_mixed_repair_manifest_requires_exact_lane_classes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mixed-repair.json"
+            targets = []
+            for number, target_class in [
+                *[(number, "current_none") for number in range(1, 149)],
+                *[(number, "grandfathered_absent") for number in range(149, 220)],
+            ]:
+                targets.append(
+                    {
+                        "wikidata_id": f"Q{number}",
+                        "target_class": target_class,
+                        "current_report_action": "none" if target_class == "current_none" else "absent",
+                        "report_row_sha256": "a" * 64 if target_class == "current_none" else None,
+                        "source_row_sha256": "b" * 64,
+                        "state_entry_sha256": "c" * 64,
+                    }
+                )
+            batch.atomic_write_json(
+                path,
+                {
+                    "schema_version": 1,
+                    "lane": "ambiguous_members_mixed_repair",
+                    "review_policy_version": batch.AMBIGUOUS_REVIEW_POLICY_VERSION,
+                    "created_utc": "2026-09-13T00:00:00+00:00",
+                    "people_csv": "people.csv",
+                    "people_sha256": "d" * 64,
+                    "report_csv": "report.csv",
+                    "report_sha256": "e" * 64,
+                    "state_path": "state.json",
+                    "state_sha256": "f" * 64,
+                    "target_count": 219,
+                    "target_counts": {"current_none": 148, "grandfathered_absent": 71},
+                    "targets": targets,
+                    "preserved_report_rows": {},
+                    "preserved_state_members": {},
+                },
+            )
+            loaded = batch._load_ambiguous_repair_manifest(path)
+            self.assertEqual(len(batch._mixed_repair_targets(loaded)), 219)
+
+    def test_none_repair_manifest_selects_only_frozen_none_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            report = root / "review.csv"
+            state_path = root / "state.json"
+            manifest_path = root / "repair.json"
+            run_dir = root / "run"
+            none_person = blank_row("Q1", "None Person", "2024")
+            approved_person = blank_row("Q2", "Approved Person", "2024")
+            for row in (none_person, approved_person):
+                row["age_status"] = "possible"
+            write_csv(
+                people,
+                TEST_COLUMNS + ["age_status"],
+                [none_person, approved_person],
+            )
+
+            report_rows = []
+            for person, action in ((none_person, "none"), (approved_person, "discard")):
+                row = {column: "" for column in batch.AMBIGUOUS_REVIEW_COLUMNS}
+                row.update(
+                    {
+                        "wikidata_id": person["wikidata_id"],
+                        "name": person["name"],
+                        "source_row_sha256": batch._ambiguous_source_row_sha256(person),
+                        "recommended_action": action,
+                        "source_run_dir": str(root / "old-run"),
+                    }
+                )
+                report_rows.append(row)
+            write_csv(report, batch.AMBIGUOUS_REVIEW_COLUMNS, report_rows)
+            batch.atomic_write_json(
+                state_path,
+                {
+                    "schema_version": 1,
+                    "members": {
+                        person["wikidata_id"]: {
+                            "source_row_sha256": batch._ambiguous_source_row_sha256(person),
+                            "source_run_dir": str(root / "old-run"),
+                        }
+                        for person in (none_person, approved_person)
+                    },
+                },
+            )
+            prepared = batch.prepare_ambiguous_repair_manifest(
+                people_csv=people,
+                review_csv=report,
+                state_path=state_path,
+                output=manifest_path,
+                action="none",
+                expected_count=1,
+            )
+            self.assertEqual(prepared["target_count"], 1)
+            self.assertEqual(prepared["preserved_report_rows"], 1)
+            batch.create_ambiguous_cohort(
+                people_csv=people,
+                cache_root=root / "cache",
+                state_path=state_path,
+                batch_size=None,
+                run_dir=run_dir,
+                target_manifest=manifest_path,
+                review_csv=report,
+            )
+            cohort = json.loads((run_dir / "cohort.json").read_text())
+            self.assertEqual(cohort["selection_mode"], "target_manifest")
+            self.assertEqual(
+                [item["wikidata_id"] for item in cohort["selected"]], ["Q1"]
+            )
+
+    def test_field_date_parser_excludes_citations_and_template_cross_field_values(self):
+        self.assertEqual(
+            batch._date_values_from_field(
+                '1845<ref>{{cite book|date=1926|access-date=17 May 2021}}</ref>',
+                "birth_date",
+            ),
+            ["1845"],
+        )
+        raw = "{{death year and age|1919|1892}}"
+        self.assertEqual(batch._date_values_from_field(raw, "death_date"), ["1919"])
+        self.assertEqual(batch._template_date_values(raw, "birth_date"), ["1892"])
+        exact = "{{death-date and age|9 July 1934|15 May 1907}}"
+        self.assertEqual(
+            batch._date_values_from_field(exact, "death_date"), ["1934-07-09"]
+        )
+
+    def test_field_date_parser_preserves_alternatives_and_uses_gregorian_conversion(self):
+        self.assertEqual(
+            batch._date_values_from_field("1379/80", "birth_date"),
+            ["1379", "1380"],
+        )
+        self.assertEqual(
+            batch._date_values_from_field(
+                "1926 A.D. (1983 BS Mangshir 10)", "birth_date"
+            ),
+            ["1926"],
+        )
+        self.assertEqual(
+            batch._date_values_from_field(
+                "Chaitra, 1852 Bikram Samwat (1796 A.D.)", "birth_date"
+            ),
+            ["1796"],
+        )
+        self.assertEqual(
+            batch._date_values_from_field("{{circa}} 1050s", "birth_date"),
+            [],
+        )
+
+    def test_scanner_keeps_out_of_range_infobox_age_as_one_range(self):
+        raw = (
+            "{{Infobox person\n| birth_date = 1379/80\n"
+            "| death_date = 19 October 1408 (aged 29–30)<ref>2020-08-15</ref>\n}}\n"
+            "'''Person''' was a ruler.\n\n==Death==\nHe died at the age of 28."
+        )
+        article = {
+            "wikidata_id": "Q1",
+            "name": "Person",
+            "article_url": "https://en.wikipedia.org/wiki/Person",
+            "language": "en",
+            "resolved_title": "Person",
+            "revision_id": 1,
+            "article_bytes": len(raw.encode()),
+            "raw_wikitext": raw,
+        }
+        person = {
+            "wikidata_id": "Q1",
+            "name": "Person",
+            "member_classes": ["possible"],
+            "age_status": "possible",
+            "birth_date": "1380",
+            "death_date": "1408",
+            "source_row_sha256": "hash",
+        }
+        record = batch._scan_ambiguous_article(
+            person, article, batch.build_packet(article)
+        )
+        self.assertEqual(record["ambiguous_infobox_ages"], [29, 30])
+        self.assertEqual(
+            [item["value"] for item in record["candidates"] if item["kind"] == "age_range"],
+            ["29-30"],
+        )
+        self.assertFalse(
+            any(
+                item["kind"] == "age" and item["source"] == "infobox"
+                for item in record["candidates"]
+            )
+        )
+        self.assertNotIn(
+            "2020-08-15",
+            [item["value"] for item in record["candidates"]],
+        )
+
+    def test_sentence_context_restores_death_context_and_omits_bibliography(self):
+        raw = (
+            "{{Infobox person|birth_date=1982|death_date=11 November 2009}}\n"
+            "'''Person''' was an activist.\n\n==Death==\n"
+            "He was executed after being sentenced to death. He was 28 years old.\n\n"
+            "==References==\n* Journal 27 (2019), pp. 26–28."
+        )
+        article = {
+            "wikidata_id": "Q1",
+            "name": "Person",
+            "article_url": "https://en.wikipedia.org/wiki/Person",
+            "language": "en",
+            "resolved_title": "Person",
+            "revision_id": 1,
+            "article_bytes": len(raw.encode()),
+            "raw_wikitext": raw,
+        }
+        person = {
+            "wikidata_id": "Q1",
+            "name": "Person",
+            "member_classes": ["possible"],
+            "age_status": "possible",
+            "birth_date": "1982",
+            "death_date": "2009",
+            "source_row_sha256": "hash",
+        }
+        record = batch._scan_ambiguous_article(
+            person, article, batch.build_packet(article)
+        )
+        body_ages = [
+            item for item in record["candidates"] if item["source"] == "article_body"
+        ]
+        self.assertEqual([item["value"] for item in body_ages], [28])
+        self.assertIn("executed", body_ages[0]["excerpt"])
+
+    def test_scanner_reads_actual_lead_lifespan_after_short_description(self):
+        raw = (
+            "{{Short description|French biologist (1860–1888)}}\n"
+            "{{Infobox person|birth_date=1860|death_date=1888}}\n"
+            "'''Person''' (8 January 1860 – 31 March 1888) was a biologist."
+        )
+        article = {
+            "wikidata_id": "Q1",
+            "name": "Person",
+            "article_url": "https://en.wikipedia.org/wiki/Person",
+            "language": "en",
+            "resolved_title": "Person",
+            "revision_id": 1,
+            "article_bytes": len(raw.encode()),
+            "raw_wikitext": raw,
+        }
+        person = {
+            "wikidata_id": "Q1",
+            "name": "Person",
+            "member_classes": ["possible"],
+            "age_status": "possible",
+            "birth_date": "1860-08-01",
+            "death_date": "1888",
+            "source_row_sha256": "hash",
+        }
+        record = batch._scan_ambiguous_article(
+            person, article, batch.build_packet(article)
+        )
+        lead_dates = {
+            (item.get("deterministic_claim_type"), item["value"])
+            for item in record["candidates"]
+            if item["kind"] == "date" and item["source"] == "lead"
+        }
+        self.assertIn(("birth_date", "1860-01-08"), lead_dates)
+        self.assertIn(("death_date", "1888-03-31"), lead_dates)
+
+    def test_body_age_ranges_are_not_singular_but_explicit_age_29_is(self):
+        text = "One source says aged 27–28. Foster died in March 1826 aged 29."
+        singular, ranges = batch._explicit_body_age_hits(text)
+        self.assertEqual([age for _, _, age in singular], [29])
+        self.assertEqual([(low, high) for _, _, low, high in ranges], [(27, 28)])
+
+    def test_selection_is_independent_of_existing_enrichment_terminal_state(self):
+        possible = blank_row("Q1", "Possible", "2024")
+        possible["age_status"] = "possible"
+        possible["cause_of_death"] = "cancer"
+        possible["manner_of_death"] = "natural causes"
+        possible["occupations"] = "actor"
+        possible["wikipedia_death_review_status"] = "settled"
+        multi_date = blank_row("Q2", "Multi", "2023")
+        multi_date["age_status"] = "confirmed"
+        multi_date["birth_date"] = "1995-01-01; 1995-01-02"
+        ordinary = blank_row("Q3", "Ordinary", "2022")
+        ordinary["age_status"] = "confirmed"
+
+        selected, eligible, pending = batch.select_ambiguous_members(
+            [ordinary, multi_date, possible], batch_size=None
+        )
+        self.assertEqual(eligible, 2)
+        self.assertEqual(pending, 2)
+        self.assertEqual([row["wikidata_id"] for row in selected], ["Q1", "Q2"])
+        self.assertEqual(batch.ambiguous_member_classes(possible), ["possible"])
+        self.assertEqual(
+            batch.ambiguous_member_classes(multi_date), ["multiple_birth_dates"]
+        )
+
+        state = {
+            "review_policy_version": batch.AMBIGUOUS_REVIEW_POLICY_VERSION,
+            "members": {
+                "Q1": {
+                    "source_row_sha256": batch._ambiguous_source_row_sha256(possible)
+                }
+            }
+        }
+        selected, _, pending = batch.select_ambiguous_members(
+            [ordinary, multi_date, possible], batch_size=None, state=state
+        )
+        self.assertEqual(pending, 1)
+        self.assertEqual([row["wikidata_id"] for row in selected], ["Q2"])
+        selected, _, pending = batch.select_ambiguous_members(
+            [ordinary, multi_date, possible],
+            batch_size=None,
+            state=state,
+            rescan_all=True,
+        )
+        self.assertEqual(pending, 2)
+        self.assertEqual(len(selected), 2)
+
+    def test_scanner_uses_visible_body_and_citation_titles_but_not_metadata(self):
+        raw = (
+            "{{Infobox person\n"
+            "| birth_date = {{Birth date|1995|7|14}}\n"
+            "| death_date = {{Death date and age|2022|7|26|1995|7|14}}\n"
+            "}}\n"
+            "'''Alex Person''' was an actor born July 14, 1995.\n\n"
+            "==Death==\n"
+            "The crash happened on 26 July 2022. "
+            "<ref>{{cite web|url=https://example.test/28/report|"
+            "title=Actor was 27 when he died|publisher=Channel 28}}</ref>"
+        )
+        article = {
+            "wikidata_id": "Q1",
+            "name": "Alex Person",
+            "article_url": "https://en.wikipedia.org/wiki/Alex_Person",
+            "language": "en",
+            "resolved_title": "Alex Person",
+            "revision_id": 123,
+            "article_bytes": len(raw.encode()),
+            "raw_wikitext": raw,
+        }
+        packet = batch.build_packet(article)
+        person = {
+            "wikidata_id": "Q1",
+            "name": "Alex Person",
+            "member_classes": ["possible"],
+            "age_status": "possible",
+            "birth_date": "1995",
+            "death_date": "2022-07-26",
+            "source_row_sha256": "hash",
+        }
+        record = batch._scan_ambiguous_article(person, article, packet)
+        self.assertEqual(record["canonical_infobox_age"], 27)
+        citation_ages = [
+            item["value"]
+            for item in record["candidates"]
+            if item["source"] == "citation_title" and item["kind"] == "age"
+        ]
+        self.assertEqual(citation_ages, [27])
+        self.assertNotIn(28, citation_ages)
+        self.assertTrue(
+            any(
+                item["kind"] == "date"
+                and item["source"] == "infobox"
+                and item["value"] == "1995-07-14"
+                for item in record["candidates"]
+            )
+        )
+        self.assertNotIn("Channel 28", batch._visible_article_body(raw))
+        self.assertNotIn("example.test/28", batch._visible_article_body(raw))
+        self.assertEqual(
+            batch._citation_titles(
+                '<ref>[https://example.test/27/report Person was 28]</ref>'
+            ),
+            ["Person was 28"],
+        )
+
+    def test_lower_precision_wikipedia_date_is_not_a_candidate(self):
+        raw = (
+            "{{Infobox person\n"
+            "| birth_date = 1995\n"
+            "| death_date = 26 July 2022\n"
+            "}}\n'''Alex Person''' was an actor."
+        )
+        article = {
+            "wikidata_id": "Q1",
+            "name": "Alex Person",
+            "article_url": "https://en.wikipedia.org/wiki/Alex_Person",
+            "language": "en",
+            "resolved_title": "Alex Person",
+            "revision_id": 1,
+            "article_bytes": len(raw.encode()),
+            "raw_wikitext": raw,
+        }
+        person = {
+            "wikidata_id": "Q1",
+            "name": "Alex Person",
+            "member_classes": ["multiple_birth_dates"],
+            "age_status": "confirmed",
+            "birth_date": "1995-07-14; 1995-07-15",
+            "death_date": "2022",
+            "source_row_sha256": "hash",
+        }
+        record = batch._scan_ambiguous_article(
+            person, article, batch.build_packet(article)
+        )
+        infobox_dates = {
+            (item["deterministic_claim_type"], item["value"])
+            for item in record["candidates"]
+            if item["kind"] == "date" and item["source"] == "infobox"
+        }
+        self.assertNotIn(("birth_date", "1995"), infobox_dates)
+        self.assertIn(("death_date", "2022-07-26"), infobox_dates)
+
+    def test_given_age_template_is_canonical_and_keeps_date_alternatives(self):
+        raw = (
+            "{{Infobox person\n"
+            "| birth_date = 1997 or 1998\n"
+            "| death_date = {{death date and given age|2025|11|01|27|df=y}}\n"
+            "}}\n'''Omid Example''' (1997 or 1998 – 1 November 2025) was an activist."
+        )
+        article = {
+            "wikidata_id": "Q1",
+            "name": "Omid Example",
+            "article_url": "https://en.wikipedia.org/wiki/Omid_Example",
+            "language": "en",
+            "resolved_title": "Omid Example",
+            "revision_id": 1,
+            "article_bytes": len(raw.encode()),
+            "raw_wikitext": raw,
+        }
+        person = {
+            "wikidata_id": "Q1",
+            "name": "Omid Example",
+            "member_classes": ["possible"],
+            "age_status": "possible",
+            "birth_date": "1997",
+            "death_date": "2025",
+            "source_row_sha256": "hash",
+        }
+        record = batch._scan_ambiguous_article(
+            person, article, batch.build_packet(article)
+        )
+        self.assertEqual(record["canonical_infobox_age"], 27)
+        infobox_births = {
+            item["value"]
+            for item in record["candidates"]
+            if item.get("deterministic_claim_type") == "birth_date"
+            and item["source"] == "infobox"
+        }
+        self.assertEqual(infobox_births, {"1997", "1998"})
+
+    def test_body_age_resolves_ambiguous_infobox_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            person = {
+                "wikidata_id": "Q1",
+                "name": "Person",
+                "age_status": "possible",
+                "birth_date": "1997",
+                "death_date": "2025",
+                "member_classes": ["possible"],
+                "source_row_sha256": "hash",
+            }
+            record = {
+                "schema_version": 1,
+                "wikidata_id": "Q1",
+                "name": "Person",
+                "article_url": "https://en.wikipedia.org/wiki/Person",
+                "revision_id": 1,
+                "member_classes": ["possible"],
+                "age_status": "possible",
+                "wikidata_birth_dates": ["1997"],
+                "wikidata_death_dates": ["2025"],
+                "source_row_sha256": "hash",
+                "canonical_infobox_age": None,
+                "ambiguous_infobox_ages": [27, 28],
+                "semantic_candidate_ids": ["C002"],
+                "candidates": [
+                    {
+                        "candidate_id": "C001",
+                        "kind": "age_range",
+                        "source": "infobox",
+                        "value": "27-28",
+                        "excerpt": "aged 27-28",
+                        "requires_semantic_review": False,
+                        "deterministic_claim_type": "other",
+                        "reason": "range",
+                    },
+                    {
+                        "candidate_id": "C002",
+                        "kind": "age",
+                        "source": "citation_title",
+                        "value": 27,
+                        "excerpt": "Actor dies at 27",
+                        "requires_semantic_review": True,
+                    },
+                ],
+            }
+            batch.atomic_write_json(
+                run_dir / "ambiguity" / "candidates" / "Q1.json", record
+            )
+            batch.atomic_write_json(
+                run_dir / "ambiguity" / "semantic" / "Q1.json",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "candidate_reviews": [
+                        {
+                            "candidate_id": "C002",
+                            "verdict": "confirmed",
+                            "claim_type": "age_at_death",
+                            "reason": "The title explicitly gives age at death.",
+                        }
+                    ],
+                    "reason": "Citation title resolves the range.",
+                },
+            )
+            row = batch._assemble_ambiguous_review_row(run_dir, person)
+            self.assertEqual(row["confirmed_age_at_death"], "27")
+            self.assertEqual(row["recommended_action"], "elevate")
+            self.assertEqual(row["conflict"], "")
+
+    def test_unresolved_membership_range_is_none_not_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            person = {
+                "wikidata_id": "Q1",
+                "name": "Person",
+                "age_status": "possible",
+                "birth_date": "1997",
+                "death_date": "2025",
+                "member_classes": ["possible"],
+                "source_row_sha256": "hash",
+            }
+            record = {
+                "schema_version": 1,
+                "wikidata_id": "Q1",
+                "name": "Person",
+                "article_url": "https://en.wikipedia.org/wiki/Person",
+                "revision_id": 1,
+                "member_classes": ["possible"],
+                "age_status": "possible",
+                "wikidata_birth_dates": ["1997"],
+                "wikidata_death_dates": ["2025"],
+                "source_row_sha256": "hash",
+                "canonical_infobox_age": None,
+                "ambiguous_infobox_ages": [27, 28],
+                "semantic_candidate_ids": [],
+                "candidates": [{
+                    "candidate_id": "C001",
+                    "kind": "age_range",
+                    "source": "infobox",
+                    "value": "27-28",
+                    "excerpt": "aged 27-28",
+                    "requires_semantic_review": False,
+                    "deterministic_claim_type": "other",
+                    "reason": "range",
+                }],
+            }
+            batch.atomic_write_json(
+                run_dir / "ambiguity" / "candidates" / "Q1.json", record
+            )
+            row = batch._assemble_ambiguous_review_row(run_dir, person)
+            self.assertEqual(row["recommended_action"], "none")
+            self.assertEqual(row["confirmed_age_at_death"], "")
+
+    def test_direct_age_action_is_not_blocked_by_unresolved_date_alternative(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            person = {
+                "wikidata_id": "Q1",
+                "name": "Person",
+                "age_status": "possible",
+                "birth_date": "1872",
+                "death_date": "1899-09-24",
+                "member_classes": ["possible"],
+                "source_row_sha256": "hash",
+            }
+            record = {
+                "schema_version": 1,
+                "wikidata_id": "Q1",
+                "name": "Person",
+                "article_url": "https://en.wikipedia.org/wiki/Person",
+                "revision_id": 1,
+                "member_classes": ["possible"],
+                "age_status": "possible",
+                "wikidata_birth_dates": ["1872"],
+                "wikidata_death_dates": ["1899-09-24"],
+                "source_row_sha256": "hash",
+                "canonical_infobox_age": None,
+                "ambiguous_infobox_ages": [],
+                "semantic_candidate_ids": ["C001"],
+                "candidates": [
+                    {"candidate_id":"C001","kind":"age","source":"article_body","value":27,"excerpt":"He died at age 27.","requires_semantic_review":True},
+                    {"candidate_id":"C002","kind":"date","source":"infobox","value":"1871","excerpt":"1871 or 1872","requires_semantic_review":False,"deterministic_claim_type":"birth_date","reason":"date"},
+                    {"candidate_id":"C003","kind":"date","source":"infobox","value":"1872","excerpt":"1871 or 1872","requires_semantic_review":False,"deterministic_claim_type":"birth_date","reason":"date"},
+                ],
+            }
+            batch.atomic_write_json(run_dir / "ambiguity" / "candidates" / "Q1.json", record)
+            batch.atomic_write_json(run_dir / "ambiguity" / "semantic" / "Q1.json", {
+                "schema_version":1,"wikidata_id":"Q1","candidate_reviews":[
+                    {"candidate_id":"C001","verdict":"confirmed","claim_type":"age_at_death","reason":"explicit"}
+                ],"reason":"explicit age"
+            })
+            row = batch._assemble_ambiguous_review_row(run_dir, person)
+            self.assertEqual(row["recommended_action"], "elevate")
+            self.assertIn("conflicting equal-precision", row["conflict"])
+
+    def test_conflicting_singular_prose_and_exact_date_ages_require_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            person = {
+                "wikidata_id":"Q1","name":"Person","age_status":"possible",
+                "birth_date":"1907","death_date":"1934","member_classes":["possible"],
+                "source_row_sha256":"hash",
+            }
+            record = {
+                "schema_version":1,"wikidata_id":"Q1","name":"Person",
+                "article_url":"https://en.wikipedia.org/wiki/Person","revision_id":1,
+                "member_classes":["possible"],"age_status":"possible",
+                "wikidata_birth_dates":["1907"],"wikidata_death_dates":["1934"],
+                "source_row_sha256":"hash","canonical_infobox_age":None,
+                "ambiguous_infobox_ages":[],"semantic_candidate_ids":["C001","C002","C003"],
+                "candidates":[
+                    {"candidate_id":"C001","kind":"age","source":"article_body","value":27,"excerpt":"He died at age 27.","requires_semantic_review":True},
+                    {"candidate_id":"C002","kind":"date","source":"lead","value":"1907-05-15","excerpt":"15 May 1907 - 14 May 1934","requires_semantic_review":True},
+                    {"candidate_id":"C003","kind":"date","source":"lead","value":"1934-05-14","excerpt":"15 May 1907 - 14 May 1934","requires_semantic_review":True},
+                ],
+            }
+            batch.atomic_write_json(run_dir / "ambiguity" / "candidates" / "Q1.json", record)
+            batch.atomic_write_json(run_dir / "ambiguity" / "semantic" / "Q1.json", {
+                "schema_version":1,"wikidata_id":"Q1","candidate_reviews":[
+                    {"candidate_id":"C001","verdict":"confirmed","claim_type":"age_at_death","reason":"explicit"},
+                    {"candidate_id":"C002","verdict":"confirmed","claim_type":"birth_date","reason":"explicit"},
+                    {"candidate_id":"C003","verdict":"confirmed","claim_type":"death_date","reason":"explicit"},
+                ],"reason":"all explicit"
+            })
+            row = batch._assemble_ambiguous_review_row(run_dir, person)
+            self.assertEqual(row["confirmed_age_at_death"], "")
+            self.assertEqual(row["recommended_action"], "review")
+            self.assertIn("singular age-at-death candidates: 26, 27", row["conflict"])
+
+    def test_conflicting_infobox_and_body_singular_ages_require_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            person = {
+                "wikidata_id": "Q1",
+                "name": "Alex Person",
+                "age_status": "possible",
+                "birth_date": "1995",
+                "death_date": "2022",
+                "member_classes": ["possible"],
+                "source_row_sha256": "hash",
+            }
+            record = {
+                "schema_version": 1,
+                "wikidata_id": "Q1",
+                "name": "Alex Person",
+                "article_url": "https://en.wikipedia.org/wiki/Alex_Person",
+                "revision_id": 1,
+                "member_classes": ["possible"],
+                "age_status": "possible",
+                "wikidata_birth_dates": ["1995"],
+                "wikidata_death_dates": ["2022"],
+                "source_row_sha256": "hash",
+                "canonical_infobox_age": 27,
+                "ambiguous_infobox_ages": [],
+                "semantic_candidate_ids": ["C002"],
+                "candidates": [
+                    {
+                        "candidate_id": "C001",
+                        "kind": "age",
+                        "source": "infobox",
+                        "value": 27,
+                        "excerpt": "died (aged 27)",
+                        "requires_semantic_review": False,
+                        "deterministic_claim_type": "age_at_death",
+                        "reason": "explicit",
+                    },
+                    {
+                        "candidate_id": "C002",
+                        "kind": "age",
+                        "source": "article_body",
+                        "value": 28,
+                        "excerpt": "The article says he was 28.",
+                        "requires_semantic_review": True,
+                    },
+                ],
+            }
+            batch.atomic_write_json(
+                run_dir / "ambiguity" / "candidates" / "Q1.json", record
+            )
+            batch.atomic_write_json(
+                run_dir / "ambiguity" / "semantic" / "Q1.json",
+                {
+                    "schema_version": 1,
+                    "wikidata_id": "Q1",
+                    "candidate_reviews": [
+                        {
+                            "candidate_id": "C002",
+                            "verdict": "confirmed",
+                            "claim_type": "age_at_death",
+                            "reason": "The body makes that claim.",
+                        }
+                    ],
+                    "reason": "The body claim is explicit.",
+                },
+            )
+            row = batch._assemble_ambiguous_review_row(run_dir, person)
+            self.assertEqual(row["confirmed_age_at_death"], "")
+            self.assertEqual(row["recommended_action"], "review")
+            self.assertIn("singular age-at-death candidates: 27, 28", row["conflict"])
+
+    def test_deterministic_tranche_finalizes_to_report_and_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            cache = root / "cache"
+            state = root / "state.json"
+            report = root / "review.csv"
+            run_dir = root / "run"
+            row = blank_row("Q1", "Alex Person", "2022")
+            row["age_status"] = "possible"
+            row["birth_date"] = "1995"
+            write_csv(people, TEST_COLUMNS + ["age_status"], [row])
+            batch.create_ambiguous_cohort(
+                people_csv=people,
+                cache_root=cache,
+                state_path=state,
+                batch_size=None,
+                run_dir=run_dir,
+            )
+            raw = (
+                "{{Infobox person\n"
+                "| birth_date = {{Birth date|1995|7|14}}\n"
+                "| death_date = {{Death date and age|2022|7|26|1995|7|14}}\n"
+                "}}\n'''Alex Person''' was an actor."
+            )
+            write_article_and_packet(cache, run_dir, "Q1", "Alex Person", raw)
+            batch.scan_ambiguous_members(cohort_value=run_dir, cache_root=cache)
+            status = batch.ambiguous_scheduler_status(cohort_value=run_dir)
+            self.assertTrue(status["tranches"][0]["reviewable"])
+            result = batch.finalize_ambiguous_tranche(
+                cohort_value=run_dir,
+                tranche=1,
+                review_csv=report,
+                state_path=state,
+            )
+            self.assertEqual(result["report_rows"], 1)
+            _, report_rows = batch.read_csv(report)
+            self.assertEqual(report_rows[0]["recommended_action"], "elevate")
+            saved_state = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(saved_state["members"]["Q1"]["outcome"], "reported")
+
+    def test_refillable_semantic_assignment_validates_and_releases_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            people = root / "people.csv"
+            cache = root / "cache"
+            run_dir = root / "run"
+            row = blank_row("Q1", "Alex Person", "2022")
+            row["age_status"] = "possible"
+            write_csv(people, TEST_COLUMNS + ["age_status"], [row])
+            batch.create_ambiguous_cohort(
+                people_csv=people,
+                cache_root=cache,
+                state_path=root / "state.json",
+                batch_size=None,
+                run_dir=run_dir,
+            )
+            write_article_and_packet(
+                cache,
+                run_dir,
+                "Q1",
+                "Alex Person",
+                "'''Alex Person''' was an actor.\n\n==Death==\nHe died at 27.",
+            )
+            batch.scan_ambiguous_members(cohort_value=run_dir, cache_root=cache)
+            with self.assertRaisesRegex(batch.BatchError, "Slot must be 1..6"):
+                batch.claim_ambiguous_assignment(cohort_value=run_dir, slot=7)
+            assignment = batch.claim_ambiguous_assignment(
+                cohort_value=run_dir, slot=6
+            )
+            self.assertEqual(assignment["role"], "ambiguous-member-review")
+            role_input = json.loads(
+                Path(assignment["items"][0]["input"]).read_text(encoding="utf-8")
+            )
+            candidate_id = role_input["candidates"][0]["candidate_id"]
+            output = root / "result.json"
+            batch.atomic_write_json(
+                output,
+                [
+                    {
+                        "schema_version": 1,
+                        "wikidata_id": "Q1",
+                        "candidate_reviews": [
+                            {
+                                "candidate_id": candidate_id,
+                                "verdict": "confirmed",
+                                "claim_type": "age_at_death",
+                                "reason": "The sentence explicitly states age at death.",
+                            }
+                        ],
+                        "reason": "The only candidate is explicit.",
+                    }
+                ],
+            )
+            completed = batch.complete_ambiguous_assignment(
+                cohort_value=run_dir,
+                assignment_id=assignment["assignment_id"],
+                input_path=output,
+            )
+            self.assertEqual(completed["installed"], ["Q1"])
+            self.assertEqual(completed["slot_released"], 6)
+            status = batch.ambiguous_scheduler_status(cohort_value=run_dir)
+            self.assertEqual(status["active_leases"], {})
+            self.assertTrue(status["tranches"][0]["reviewable"])
 
 
 if __name__ == "__main__":

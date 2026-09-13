@@ -40,6 +40,7 @@ BROWSER_BUILDER = REPO_ROOT / "age-27-browser" / "build_data.py"
 BROWSER_DATA = REPO_ROOT / "age-27-browser" / "data.js"
 CACHE_ROOT = PROJECT_DIR / ".cache" / "wikipedia-fallback"
 REVIEW_CSV = PROJECT_DIR / "wikipedia_stronger_model_review.csv"
+AMBIGUOUS_REVIEW_CSV = PROJECT_DIR / "wikipedia_ambiguous_members_review.csv"
 REMOVED_ENTRIES_CSV = PROJECT_DIR / "removed_entries.csv"
 TRUSTED_VOCABULARY = PROJECT_DIR / "wikipedia_fallback_vocabulary.json"
 APPROVED_VOCABULARY = CACHE_ROOT / "approved-vocabulary.json"
@@ -91,6 +92,27 @@ REVIEW_COLUMNS = [
     "proposed_occupation_qid",
     "evidence_basis",
 ]
+AMBIGUOUS_REVIEW_COLUMNS = [
+    "wikidata_id",
+    "name",
+    "article_url",
+    "revision_id",
+    "member_classes",
+    "existing_age_status",
+    "wikidata_birth_dates",
+    "wikidata_death_dates",
+    "source_row_sha256",
+    "confirmed_age_at_death",
+    "recommended_birth_date",
+    "recommended_death_date",
+    "evidence_sources",
+    "evidence_excerpts",
+    "conflict",
+    "recommended_action",
+    "reason",
+    "reviewed_utc",
+    "source_run_dir",
+]
 REMOVED_ENTRY_METADATA_COLUMNS = ["removal_reason", "removed_utc", "source_run_dir"]
 STATUSES = {"settled", "provisional", "disputed", "unknown", "possible_removal"}
 REMOVAL_REASONS = {
@@ -117,6 +139,32 @@ SUBJECT_MATCHES = {"match", "mismatch", "unclear"}
 SPECIAL_VALUES = {"somevalue", "novalue"}
 QID_RE = re.compile(r"Q[1-9][0-9]*")
 DATE_RE = re.compile(r"^([+-]?\d+)(?:-(\d{2}))?(?:-(\d{2}))?$")
+AMBIGUOUS_ACTIONS = {"discard", "elevate", "update", "review", "none"}
+AMBIGUOUS_REVIEW_POLICY_VERSION = 3
+AMBIGUOUS_VERDICTS = {"confirmed", "rejected", "ambiguous"}
+AMBIGUOUS_CLAIM_TYPES = {"age_at_death", "birth_date", "death_date", "other"}
+AMBIGUOUS_ASSIGNMENT_LIMITS = {"max_bytes": 64 * 1024, "max_items": 20}
+MONTH_NUMBERS = {
+    name: number
+    for number, names in enumerate(
+        (
+            (),
+            ("january", "jan"),
+            ("february", "feb"),
+            ("march", "mar"),
+            ("april", "apr"),
+            ("may",),
+            ("june", "jun"),
+            ("july", "jul"),
+            ("august", "aug"),
+            ("september", "sep", "sept"),
+            ("october", "oct"),
+            ("november", "nov"),
+            ("december", "dec"),
+        )
+    )
+    for name in names
+}
 SOURCE_TIERS = {
     "lead_sentence",
     "rest_of_lead_paragraph",
@@ -380,6 +428,395 @@ def eligibility_status(
         result["target_count"] = len(target_qids or [])
         result["target_remaining"] = eligible_count
     return result
+
+
+def ambiguous_member_classes(row: Mapping[str, str]) -> list[str]:
+    """Return the independent Wikipedia-review classes for one live member."""
+
+    classes = []
+    if str(row.get("age_status", "")).strip() == "possible":
+        classes.append("possible")
+    if len(split_values(row.get("birth_date", ""))) > 1:
+        classes.append("multiple_birth_dates")
+    if len(split_values(row.get("death_date", ""))) > 1:
+        classes.append("multiple_death_dates")
+    return classes
+
+
+def _ambiguous_source_row_sha256(row: Mapping[str, str]) -> str:
+    payload = {
+        key: str(row.get(key, ""))
+        for key in (
+            "wikidata_id",
+            "name",
+            "wikipedia_url",
+            "age_status",
+            "birth_date",
+            "death_date",
+        )
+    }
+    return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
+
+
+def _load_ambiguous_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "schema_version": 2,
+            "review_policy_version": AMBIGUOUS_REVIEW_POLICY_VERSION,
+            "members": {},
+        }
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") not in {1, 2}
+        or not isinstance(value.get("members"), dict)
+    ):
+        raise BatchError(f"Invalid ambiguous-member state: {path}")
+    return value
+
+
+def _ambiguous_review_row_sha256(row: Mapping[str, str]) -> str:
+    return hashlib.sha256(canonical_json(dict(row)).encode()).hexdigest()
+
+
+def prepare_ambiguous_repair_manifest(
+    *,
+    people_csv: Path,
+    review_csv: Path,
+    state_path: Path,
+    output: Path,
+    action: str,
+    expected_count: int,
+) -> dict[str, Any]:
+    """Freeze an exact report-action repair target with preservation hashes."""
+
+    if action not in AMBIGUOUS_ACTIONS:
+        raise BatchError(f"Invalid repair action: {action}")
+    fields, report_rows = read_csv(review_csv)
+    if fields != AMBIGUOUS_REVIEW_COLUMNS:
+        raise BatchError("Ambiguous-member review CSV schema mismatch")
+    _, people_rows = read_csv(people_csv)
+    people_by_qid = {row["wikidata_id"]: row for row in people_rows}
+    state = _load_ambiguous_state(state_path)
+    target = [row for row in report_rows if row["recommended_action"] == action]
+    if len(target) != expected_count:
+        raise BatchError(
+            f"Expected {expected_count} {action!r} rows, found {len(target)}"
+        )
+    target_records = []
+    for row in target:
+        qid = row["wikidata_id"]
+        person = people_by_qid.get(qid)
+        if person is None or not ambiguous_member_classes(person):
+            raise BatchError(f"Repair target is not a live ambiguous member: {qid}")
+        source_hash = _ambiguous_source_row_sha256(person)
+        if source_hash != row["source_row_sha256"]:
+            raise BatchError(f"Repair target source row changed: {qid}")
+        previous = state["members"].get(qid)
+        if not previous or previous.get("source_row_sha256") != source_hash:
+            raise BatchError(f"Repair target completion state is stale: {qid}")
+        target_records.append(
+            {
+                "wikidata_id": qid,
+                "name": row["name"],
+                "source_row_sha256": source_hash,
+                "report_row_sha256": _ambiguous_review_row_sha256(row),
+                "source_run_dir": row["source_run_dir"],
+            }
+        )
+    target_qids = {item["wikidata_id"] for item in target_records}
+    preserved = {
+        row["wikidata_id"]: _ambiguous_review_row_sha256(row)
+        for row in report_rows
+        if row["wikidata_id"] not in target_qids
+    }
+    manifest = {
+        "schema_version": 1,
+        "lane": "ambiguous_members_repair",
+        "review_policy_version": AMBIGUOUS_REVIEW_POLICY_VERSION,
+        "target_action": action,
+        "expected_count": expected_count,
+        "report_sha256": hashlib.sha256(review_csv.read_bytes()).hexdigest(),
+        "state_sha256": hashlib.sha256(state_path.read_bytes()).hexdigest(),
+        "target_rows": target_records,
+        "preserved_report_rows": preserved,
+        "preserved_state_qids_sha256": hashlib.sha256(
+            "\n".join(sorted(set(state["members"]) - target_qids)).encode()
+        ).hexdigest(),
+        "created_utc": utc_now(),
+    }
+    atomic_write_json(output, manifest)
+    return {
+        "manifest": str(output),
+        "target_action": action,
+        "target_count": len(target_records),
+        "preserved_report_rows": len(preserved),
+        "report_sha256": manifest["report_sha256"],
+        "state_sha256": manifest["state_sha256"],
+    }
+
+
+def _load_ambiguous_repair_manifest(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if value.get("lane") == "ambiguous_members_mixed_repair":
+        required = {
+            "schema_version", "lane", "review_policy_version", "created_utc",
+            "people_csv", "people_sha256", "report_csv", "report_sha256",
+            "state_path", "state_sha256", "target_count", "target_counts",
+            "targets", "preserved_report_rows", "preserved_state_members",
+        }
+        if (
+            not isinstance(value, dict)
+            or set(value) != required
+            or value.get("schema_version") != 1
+            or value.get("review_policy_version") != AMBIGUOUS_REVIEW_POLICY_VERSION
+            or not isinstance(value.get("targets"), list)
+            or len(value["targets"]) != value.get("target_count")
+            or value.get("target_counts") != {"current_none": 148, "grandfathered_absent": 71}
+            or value.get("target_count") != 219
+            or not isinstance(value.get("preserved_report_rows"), dict)
+            or not isinstance(value.get("preserved_state_members"), dict)
+        ):
+            raise BatchError(f"Invalid mixed ambiguous-member repair manifest: {path}")
+        qids = [str(item.get("wikidata_id", "")) for item in value["targets"]]
+        classes = [item.get("target_class") for item in value["targets"]]
+        if (
+            any(not QID_RE.fullmatch(qid) for qid in qids)
+            or len(qids) != len(set(qids))
+            or classes.count("current_none") != 148
+            or classes.count("grandfathered_absent") != 71
+            or any(item.get("target_class") not in {"current_none", "grandfathered_absent"} for item in value["targets"])
+        ):
+            raise BatchError(f"Invalid mixed repair manifest targets: {path}")
+        for item in value["targets"]:
+            if item["target_class"] == "current_none":
+                if item.get("current_report_action") != "none" or not item.get("report_row_sha256"):
+                    raise BatchError(f"Invalid current-none repair target: {item['wikidata_id']}")
+            elif item.get("current_report_action") != "absent" or item.get("report_row_sha256") is not None:
+                raise BatchError(f"Invalid grandfathered-absent repair target: {item['wikidata_id']}")
+            for key in ("source_row_sha256", "state_entry_sha256"):
+                if not isinstance(item.get(key), str) or len(item[key]) != 64:
+                    raise BatchError(f"Invalid mixed repair target hash: {item['wikidata_id']}")
+        return value
+    required = {
+        "schema_version",
+        "lane",
+        "review_policy_version",
+        "target_action",
+        "expected_count",
+        "report_sha256",
+        "state_sha256",
+        "target_rows",
+        "preserved_report_rows",
+        "preserved_state_qids_sha256",
+        "created_utc",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("lane") != "ambiguous_members_repair"
+        or value.get("review_policy_version") != AMBIGUOUS_REVIEW_POLICY_VERSION
+        or not isinstance(value.get("target_rows"), list)
+        or len(value["target_rows"]) != value.get("expected_count")
+    ):
+        raise BatchError(f"Invalid ambiguous-member repair manifest: {path}")
+    qids = [str(item.get("wikidata_id", "")) for item in value["target_rows"]]
+    if any(not QID_RE.fullmatch(qid) for qid in qids) or len(qids) != len(set(qids)):
+        raise BatchError(f"Invalid repair manifest QIDs: {path}")
+    return value
+
+
+def _mixed_repair_targets(manifest: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return target records across legacy and explicit mixed repair manifests."""
+
+    return manifest["targets"] if manifest.get("lane") == "ambiguous_members_mixed_repair" else manifest["target_rows"]
+
+
+def select_ambiguous_members(
+    rows: Sequence[dict[str, str]],
+    *,
+    batch_size: int | None,
+    state: Mapping[str, Any] | None = None,
+    rescan_all: bool = False,
+) -> tuple[list[dict[str, str]], int, int]:
+    """Select live ambiguous members independently of enrichment terminal state."""
+
+    if batch_size is not None and batch_size <= 0:
+        raise BatchError("Batch size must be positive")
+    processed = (state or {}).get("members", {})
+    state_policy_current = (
+        (state or {}).get("review_policy_version")
+        == AMBIGUOUS_REVIEW_POLICY_VERSION
+    )
+    eligible = [row for row in rows if ambiguous_member_classes(row)]
+    eligible.sort(key=lambda row: (row["wikidata_id"], row["name"].casefold()))
+    pending = [
+        row
+        for row in eligible
+        if rescan_all
+        or not state_policy_current
+        or str(processed.get(row["wikidata_id"], {}).get("source_row_sha256", ""))
+        != _ambiguous_source_row_sha256(row)
+    ]
+    selected = pending if batch_size is None else pending[:batch_size]
+    return selected, len(eligible), len(pending)
+
+
+def ambiguous_member_status(
+    *,
+    people_csv: Path,
+    state_path: Path,
+    limit: int = 3,
+    rescan_all: bool = False,
+) -> dict[str, Any]:
+    _, rows = read_csv(people_csv)
+    state = _load_ambiguous_state(state_path)
+    selected, eligible_count, pending_count = select_ambiguous_members(
+        rows,
+        batch_size=max(limit, 1),
+        state=state,
+        rescan_all=rescan_all,
+    )
+    return {
+        "lane": "ambiguous_members",
+        "eligible_count": eligible_count,
+        "pending_count": pending_count,
+        "processed_current_count": eligible_count - pending_count,
+        "rescan_all": rescan_all,
+        "next": [
+            {
+                "wikidata_id": row["wikidata_id"],
+                "name": row["name"],
+                "member_classes": ambiguous_member_classes(row),
+            }
+            for row in selected[: max(limit, 0)]
+        ],
+    }
+
+
+def create_ambiguous_cohort(
+    *,
+    people_csv: Path,
+    cache_root: Path,
+    state_path: Path,
+    batch_size: int | None,
+    run_dir: Path | None = None,
+    rescan_all: bool = False,
+    target_manifest: Path | None = None,
+    review_csv: Path = AMBIGUOUS_REVIEW_CSV,
+) -> Path:
+    """Freeze an independent cohort spanning all live ambiguous-member states."""
+
+    run_started_utc = utc_now()
+    fieldnames, rows = read_csv(people_csv)
+    state = _load_ambiguous_state(state_path)
+    repair_manifest: dict[str, Any] | None = None
+    if target_manifest is not None:
+        if batch_size is not None or rescan_all:
+            raise BatchError("Target-manifest selection cannot use batch size or rescan-all")
+        repair_manifest = _load_ambiguous_repair_manifest(target_manifest)
+        if hashlib.sha256(people_csv.read_bytes()).hexdigest() != repair_manifest.get(
+            "people_sha256", hashlib.sha256(people_csv.read_bytes()).hexdigest()
+        ):
+            raise BatchError("People CSV changed after repair freeze")
+        if hashlib.sha256(review_csv.read_bytes()).hexdigest() != repair_manifest["report_sha256"]:
+            raise BatchError("Ambiguous-member review CSV changed after repair freeze")
+        if hashlib.sha256(state_path.read_bytes()).hexdigest() != repair_manifest["state_sha256"]:
+            raise BatchError("Ambiguous-member state changed after repair freeze")
+        eligible = {row["wikidata_id"]: row for row in rows if ambiguous_member_classes(row)}
+        report_fields, report_rows = read_csv(review_csv)
+        if report_fields != AMBIGUOUS_REVIEW_COLUMNS:
+            raise BatchError("Ambiguous-member review CSV schema mismatch")
+        report_by_qid = {row["wikidata_id"]: row for row in report_rows}
+        if len(report_by_qid) != len(report_rows):
+            raise BatchError("Duplicate QID in ambiguous-member review CSV")
+        selected = []
+        for item in _mixed_repair_targets(repair_manifest):
+            qid = item["wikidata_id"]
+            row = eligible.get(qid)
+            if row is None or _ambiguous_source_row_sha256(row) != item["source_row_sha256"]:
+                raise BatchError(f"Repair target changed or is no longer eligible: {qid}")
+            if repair_manifest.get("lane") == "ambiguous_members_mixed_repair":
+                state_entry = state["members"].get(qid)
+                if state_entry is None or hashlib.sha256(canonical_json(state_entry).encode()).hexdigest() != item["state_entry_sha256"]:
+                    raise BatchError(f"Repair target state changed: {qid}")
+                report_row = report_by_qid.get(qid)
+                if item["target_class"] == "current_none":
+                    if report_row is None or report_row["recommended_action"] != "none" or _ambiguous_review_row_sha256(report_row) != item["report_row_sha256"]:
+                        raise BatchError(f"Repair target report changed or is ineligible: {qid}")
+                elif report_row is not None or state_entry.get("outcome") != "no_reportable_evidence":
+                    raise BatchError(f"Grandfathered repair target classification changed: {qid}")
+            selected.append(row)
+        eligible_count = len(eligible)
+        pending_count = len(selected)
+    else:
+        selected, eligible_count, pending_count = select_ambiguous_members(
+            rows,
+            batch_size=batch_size,
+            state=state,
+            rescan_all=rescan_all,
+        )
+    if not selected:
+        raise BatchError("No ambiguous members remain for cohort selection")
+    qids = [row["wikidata_id"] for row in selected]
+    cohort_hash = hashlib.sha256("\n".join(qids).encode()).hexdigest()
+    if run_dir is None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_dir = cache_root / "ambiguous-cohorts" / f"{stamp}-{cohort_hash[:12]}"
+    if (run_dir / "cohort.json").exists():
+        raise BatchError(f"Cohort already exists: {run_dir}")
+    selected_records = []
+    for ordinal, row in enumerate(selected):
+        selected_records.append(
+            {
+                "ordinal": ordinal,
+                "approval_tranche": ordinal // APPROVAL_TRANCHE_SIZE + 1,
+                "wikidata_id": row["wikidata_id"],
+                "name": row["name"],
+                "wikipedia_url": row["wikipedia_url"],
+                "age_status": row["age_status"],
+                "birth_date": row["birth_date"],
+                "death_date": row["death_date"],
+                "member_classes": ambiguous_member_classes(row),
+                "source_row_sha256": _ambiguous_source_row_sha256(row),
+            }
+        )
+    cohort = {
+        "schema_version": 2,
+        "lane": "ambiguous_members",
+        "run_started_utc": run_started_utc,
+        "requested_batch_size": batch_size,
+        "selection_mode": (
+            "target_manifest"
+            if target_manifest is not None
+            else "rescan_all" if rescan_all else "pending"
+        ),
+        "approval_tranche_size": APPROVAL_TRANCHE_SIZE,
+        "eligible_count_at_selection": eligible_count,
+        "pending_count_at_selection": pending_count,
+        "selected_count": len(selected_records),
+        "cohort_hash": cohort_hash,
+        "public_csv_columns": fieldnames,
+        "state_path": str(state_path),
+        "selected": selected_records,
+        "stages": {"selection_complete_utc": utc_now()},
+    }
+    if target_manifest is not None and repair_manifest is not None:
+        cohort["target_manifest"] = str(target_manifest)
+        cohort["target_manifest_sha256"] = hashlib.sha256(
+            target_manifest.read_bytes()
+        ).hexdigest()
+        cohort["target_action"] = repair_manifest.get("target_action", "mixed")
+    atomic_write_json(run_dir / "cohort.json", cohort)
+    return run_dir
+
+
+def _require_ambiguous_cohort(value: Path) -> tuple[Path, dict[str, Any]]:
+    run_dir, cohort = cohort_paths(value)
+    if cohort.get("lane") != "ambiguous_members":
+        raise BatchError("Command requires an ambiguous_members cohort")
+    return run_dir, cohort
 
 
 def canonical_json(value: object) -> str:
@@ -1104,6 +1541,962 @@ def build_packet(article: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _iter_wikitext_templates(text: str) -> list[str]:
+    """Return balanced templates, including nested templates, in source order."""
+
+    stack: list[int] = []
+    found: list[tuple[int, str]] = []
+    index = 0
+    while index < len(text) - 1:
+        token = text[index : index + 2]
+        if token == "{{":
+            stack.append(index)
+            index += 2
+            continue
+        if token == "}}" and stack:
+            start = stack.pop()
+            found.append((start, text[start : index + 2]))
+            index += 2
+            continue
+        index += 1
+    return [raw for _, raw in sorted(found, key=lambda item: item[0])]
+
+
+def _split_template_parts(raw: str) -> list[str]:
+    inner = raw[2:-2] if raw.startswith("{{") and raw.endswith("}}") else raw
+    parts: list[str] = []
+    start = 0
+    template_depth = 0
+    link_depth = 0
+    index = 0
+    while index < len(inner):
+        token = inner[index : index + 2]
+        if token == "{{":
+            template_depth += 1
+            index += 2
+            continue
+        if token == "}}" and template_depth:
+            template_depth -= 1
+            index += 2
+            continue
+        if token == "[[":
+            link_depth += 1
+            index += 2
+            continue
+        if token == "]]" and link_depth:
+            link_depth -= 1
+            index += 2
+            continue
+        if inner[index] == "|" and template_depth == 0 and link_depth == 0:
+            parts.append(inner[start:index].strip())
+            start = index + 1
+        index += 1
+    parts.append(inner[start:].strip())
+    return parts
+
+
+def _template_parameters(raw: str) -> tuple[str, list[str], dict[str, str]]:
+    parts = _split_template_parts(raw)
+    name = (parts[0] if parts else "").casefold().replace("_", " ").strip()
+    positional: list[str] = []
+    named: dict[str, str] = {}
+    for part in parts[1:]:
+        if "=" in part:
+            key, value = part.split("=", 1)
+            named[key.strip().casefold().replace("_", " ")] = value.strip()
+        else:
+            positional.append(part.strip())
+    return name, positional, named
+
+
+def _infobox_fields(infobox_raw: str) -> dict[str, str]:
+    _, positional, named = _template_parameters(infobox_raw)
+    del positional
+    return named
+
+
+def _citation_titles(raw: str) -> list[str]:
+    titles: list[str] = []
+    for template in _iter_wikitext_templates(raw):
+        name, _, named = _template_parameters(template)
+        if not name.startswith(("cite ", "citation")):
+            continue
+        for key in ("title", "chapter"):
+            value = clean_wikitext(named.get(key, ""))
+            if value and value not in titles:
+                titles.append(value)
+    for reference in re.finditer(
+        r"<ref\b[^>]*>(.*?)</ref\s*>", raw, flags=re.I | re.S
+    ):
+        for link in re.finditer(
+            r"\[https?://[^\s\]]+\s+([^\]]+)\]", reference.group(1), flags=re.I
+        ):
+            value = clean_wikitext(link.group(1))
+            if value and value not in titles:
+                titles.append(value)
+    return titles
+
+
+NON_PROSE_SECTION_HEADINGS = {
+    "bibliography",
+    "external links",
+    "further reading",
+    "notes",
+    "references",
+    "sources",
+}
+
+
+def _without_reference_metadata(raw: str) -> str:
+    """Remove citation containers without exposing their metadata as subject text."""
+
+    value = re.sub(r"<!--.*?-->", " ", raw, flags=re.S)
+    value = re.sub(r"<ref\b[^>]*/>", " ", value, flags=re.I)
+    value = re.sub(r"<ref\b[^>]*>.*?</ref\s*>", " ", value, flags=re.I | re.S)
+    citation_prefixes = ("cite ", "citation", "sfn", "harv", "efn")
+    for template in reversed(_iter_wikitext_templates(value)):
+        name, _, _ = _template_parameters(template)
+        if name.startswith(citation_prefixes):
+            value = value.replace(template, " ")
+    return value
+
+
+def _visible_article_body(raw: str) -> str:
+    """Clean biographical prose while excluding refs and bibliography sections."""
+
+    _, without_infobox = _balanced_template(raw, r"\{\{\s*Infobox\b")
+    heading_re = re.compile(r"^(={2,4})\s*([^=].*?)\s*\1\s*$", flags=re.M)
+    matches = list(heading_re.finditer(without_infobox))
+    chunks = [without_infobox[: matches[0].start()] if matches else without_infobox]
+    excluded_level: int | None = None
+    for index, match in enumerate(matches):
+        level = len(match.group(1))
+        heading = clean_wikitext(match.group(2)).casefold()
+        if excluded_level is not None and level <= excluded_level:
+            excluded_level = None
+        if heading in NON_PROSE_SECTION_HEADINGS:
+            excluded_level = level
+            continue
+        if excluded_level is not None and level > excluded_level:
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(without_infobox)
+        chunks.append(f"{clean_wikitext(match.group(2))}: {without_infobox[match.end():end]}")
+    return clean_wikitext(_without_reference_metadata(" ".join(chunks)))
+
+
+def _date_precision(value: str) -> int:
+    match = DATE_RE.fullmatch(value.strip())
+    if not match:
+        return 0
+    return 3 if match.group(3) else 2 if match.group(2) else 1
+
+
+def _format_date(year: int, month: int | None = None, day: int | None = None) -> str:
+    sign = "-" if year < 0 else ""
+    year_text = f"{abs(year):04d}"
+    if month is None:
+        return f"{sign}{year_text}"
+    if day is None:
+        return f"{sign}{year_text}-{month:02d}"
+    return f"{sign}{year_text}-{month:02d}-{day:02d}"
+
+
+def _valid_date_value(value: str) -> bool:
+    match = DATE_RE.fullmatch(value)
+    if not match:
+        return False
+    month = int(match.group(2)) if match.group(2) else None
+    day = int(match.group(3)) if match.group(3) else None
+    if month is not None and not 1 <= month <= 12:
+        return False
+    if day is not None and (
+        month is None or not 1 <= day <= _month_days(int(match.group(1)), month)
+    ):
+        return False
+    return day is None or month is not None
+
+
+STANDARD_DEATH_DATE_TEMPLATES = {"death date", "death date and age", "dda"}
+STANDARD_DEATH_YEAR_TEMPLATES = {"death year and age"}
+GIVEN_AGE_DATE_TEMPLATES = {"death date and given age"}
+TEXT_DEATH_DATE_TEMPLATES = {
+    "death-date and age",
+    "death date and age text",
+    "d-da",
+}
+
+
+def _template_date_values(raw: str, field: str) -> list[str]:
+    values: list[str] = []
+    for template in _iter_wikitext_templates(raw):
+        name, positional, _ = _template_parameters(template)
+        triples: list[list[str]] = []
+        if field == "birth_date" and name.startswith(("birth date", "bda")):
+            triples.append(positional[:3])
+        elif field == "death_date" and name in STANDARD_DEATH_DATE_TEMPLATES:
+            triples.append(positional[:3])
+        elif field == "birth_date" and name in {"death date and age", "dda"}:
+            triples.append(positional[3:6])
+        elif field == "death_date" and name in STANDARD_DEATH_YEAR_TEMPLATES:
+            triples.append(positional[:1])
+        elif field == "birth_date" and name in STANDARD_DEATH_YEAR_TEMPLATES:
+            triples.append(positional[1:2])
+        elif field == "death_date" and name in GIVEN_AGE_DATE_TEMPLATES:
+            triples.append(positional[:3])
+        elif name in TEXT_DEATH_DATE_TEMPLATES and len(positional) >= 2:
+            position = 0 if field == "death_date" else 1
+            for value in _date_values_from_text(
+                positional[position], allow_bare_year=True
+            ):
+                if value not in values:
+                    values.append(value)
+        for parts in triples:
+            if not parts or not re.fullmatch(r"[+-]?\d+", parts[0] or ""):
+                continue
+            numbers = [int(parts[0])]
+            for part in parts[1:3]:
+                if not re.fullmatch(r"\d+", part or ""):
+                    break
+                numbers.append(int(part))
+            value = _format_date(*numbers)
+            if _valid_date_value(value) and value not in values:
+                values.append(value)
+    return [
+        value
+        for value in values
+        if not any(other.startswith(value + "-") for other in values)
+    ]
+
+
+def _date_values_from_text(text: str, *, allow_bare_year: bool) -> list[str]:
+    values: list[str] = []
+
+    def add(year: str, month: str | None = None, day: str | None = None) -> None:
+        value = _format_date(
+            int(year), int(month) if month else None, int(day) if day else None
+        )
+        if _valid_date_value(value) and value not in values:
+            values.append(value)
+
+    for match in re.finditer(
+        r"(?<!\d)([+-]?\d{1,4})-(\d{1,2})-(\d{1,2})(?!\d)", text
+    ):
+        add(match.group(1), match.group(2), match.group(3))
+    month_pattern = "|".join(sorted(MONTH_NUMBERS, key=len, reverse=True))
+    for match in re.finditer(
+        rf"\b(\d{{1,2}})\s+({month_pattern})\.?\s+([+-]?\d{{3,4}})\b",
+        text,
+        flags=re.I,
+    ):
+        add(match.group(3), str(MONTH_NUMBERS[match.group(2).casefold()]), match.group(1))
+    for match in re.finditer(
+        rf"\b({month_pattern})\.?\s+(\d{{1,2}}),?\s+([+-]?\d{{3,4}})\b",
+        text,
+        flags=re.I,
+    ):
+        add(match.group(3), str(MONTH_NUMBERS[match.group(1).casefold()]), match.group(2))
+    for match in re.finditer(
+        rf"\b({month_pattern})\.?\s+([+-]?\d{{3,4}})\b", text, flags=re.I
+    ):
+        add(match.group(2), str(MONTH_NUMBERS[match.group(1).casefold()]))
+    if allow_bare_year:
+        cleaned = clean_wikitext(text)
+        if re.fullmatch(r"[+-]?\d{1,4}", cleaned):
+            add(cleaned)
+        for match in re.finditer(
+            r"\b(?:born|birth|died|death)\D{0,24}([12]\d{3})\b",
+            cleaned,
+            flags=re.I,
+        ):
+            add(match.group(1))
+    return [
+        value
+        for value in values
+        if not any(other.startswith(value + "-") for other in values)
+    ]
+
+
+def _expanded_year_alternatives(text: str) -> list[str]:
+    values: list[str] = []
+    for match in re.finditer(r"(?<!\d)([12]\d{3})\s*/\s*(\d{2}|[12]\d{3})(?!\d)", text):
+        first = int(match.group(1))
+        second_text = match.group(2)
+        second = (
+            int(second_text)
+            if len(second_text) == 4
+            else (first // 100) * 100 + int(second_text)
+        )
+        values.extend((_format_date(first), _format_date(second)))
+    return list(dict.fromkeys(values))
+
+
+def _plain_field_date_values(raw: str) -> list[str]:
+    text = clean_wikitext(raw)
+    values = _date_values_from_text(text, allow_bare_year=True)
+    for value in _expanded_year_alternatives(text):
+        if value not in values:
+            values.append(value)
+
+    gregorian_years = [
+        _format_date(int(match.group(1)))
+        for match in re.finditer(
+            r"(?<!\d)([12]\d{3})\s*(?:A\.?\s*D\.?|C\.?\s*E\.?)\b",
+            text,
+            flags=re.I,
+        )
+    ]
+    if gregorian_years:
+        precise = [value for value in values if _date_precision(value) > 1]
+        return list(dict.fromkeys([*precise, *gregorian_years]))
+
+    local_spans = [
+        match.span(1)
+        for match in re.finditer(
+            r"(?<!\d)([12]\d{3})\s*(?:B\.?\s*S\.?|Bikram\s+Samwat|Vikram\s+Samvat)\b",
+            text,
+            flags=re.I,
+        )
+    ]
+    for match in re.finditer(r"(?<!\d)([12]\d{3})(?![\ds])", text, flags=re.I):
+        if any(start <= match.start(1) and match.end(1) <= end for start, end in local_spans):
+            continue
+        value = _format_date(int(match.group(1)))
+        if value not in values:
+            values.append(value)
+    return [
+        value
+        for value in values
+        if not any(other.startswith(value + "-") for other in values)
+    ]
+
+
+def _date_values_from_field(raw: str, field: str) -> list[str]:
+    visible = _without_reference_metadata(raw)
+    values = _template_date_values(visible, field)
+    plain = visible
+    recognized = (
+        STANDARD_DEATH_DATE_TEMPLATES
+        | STANDARD_DEATH_YEAR_TEMPLATES
+        | GIVEN_AGE_DATE_TEMPLATES
+        | TEXT_DEATH_DATE_TEMPLATES
+    )
+    for template in reversed(_iter_wikitext_templates(plain)):
+        name, _, _ = _template_parameters(template)
+        if name.startswith(("birth date", "bda")) or name in recognized:
+            plain = plain.replace(template, " ")
+    for value in _plain_field_date_values(plain):
+        if value not in values:
+            values.append(value)
+    if not values:
+        for match in re.finditer(
+            r"(?<!\d)([12]\d{3})(?![\ds])", clean_wikitext(plain), flags=re.I
+        ):
+            value = _format_date(int(match.group(1)))
+            if value not in values:
+                values.append(value)
+    return [
+        value
+        for value in values
+        if not any(other.startswith(value + "-") for other in values)
+    ]
+
+
+def _is_leap_year(year: int) -> bool:
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def _month_days(year: int, month: int) -> int:
+    if month == 2:
+        return 29 if _is_leap_year(year) else 28
+    return 30 if month in {4, 6, 9, 11} else 31
+
+
+def _date_bounds(value: str) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    match = DATE_RE.fullmatch(value)
+    if not match:
+        raise BatchError(f"Invalid date value: {value}")
+    year = int(match.group(1))
+    if not match.group(2):
+        return (year, 1, 1), (year, 12, 31)
+    month = int(match.group(2))
+    if not match.group(3):
+        return (year, month, 1), (year, month, _month_days(year, month))
+    day = int(match.group(3))
+    return (year, month, day), (year, month, day)
+
+
+def _age_on(birth: tuple[int, int, int], death: tuple[int, int, int]) -> int:
+    return death[0] - birth[0] - (death[1:] < birth[1:])
+
+
+def _age_bounds(birth: str, death: str) -> tuple[int, int]:
+    birth_early, birth_late = _date_bounds(birth)
+    death_early, death_late = _date_bounds(death)
+    return _age_on(birth_late, death_early), _age_on(birth_early, death_late)
+
+
+def _context_excerpt(text: str, start: int, end: int, radius: int = 150) -> str:
+    left = max(0, start - radius)
+    right = min(len(text), end + radius)
+    excerpt = text[left:right].strip()
+    return ("…" if left else "") + excerpt + ("…" if right < len(text) else "")
+
+
+def _sentence_context_excerpt(
+    text: str, start: int, end: int, *, preceding: int = 2, following: int = 1
+) -> str:
+    """Return whole-sentence context without clipping the evidence sentence."""
+
+    boundaries = [0]
+    boundaries.extend(
+        match.end()
+        for match in re.finditer(r"(?<=[.!?])\s+(?=[A-Z0-9“\"'])", text)
+    )
+    boundaries.append(len(text))
+    spans = [
+        (boundaries[index], boundaries[index + 1])
+        for index in range(len(boundaries) - 1)
+    ]
+    match_index = next(
+        (
+            index
+            for index, (left, right) in enumerate(spans)
+            if left <= start < right or left < end <= right
+        ),
+        0,
+    )
+    first = max(0, match_index - preceding)
+    last = min(len(spans), match_index + following + 1)
+    left = spans[first][0]
+    right = spans[last - 1][1]
+    excerpt = text[left:right].strip()
+    return ("…" if left else "") + excerpt + ("…" if right < len(text) else "")
+
+
+def _lead_lifespan_date_pairs(packet: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    """Return role-labeled birth/death pairs from parenthetical lead lifespans.
+
+    Packetization can place a short description, hatnote, or image before the
+    actual biographical lead.  Search the complete lead material, but accept
+    only the conventional parenthetical ``birth date - death date`` form so
+    unrelated lead dates do not acquire deterministic roles.
+    """
+
+    lead = " ".join(
+        str(packet.get(key, "")).strip()
+        for key in ("lead_sentence", "rest_of_lead_paragraph", "remaining_lead_section")
+        if str(packet.get(key, "")).strip()
+    )
+    pairs: list[tuple[str, str, str]] = []
+    for match in re.finditer(r"\(([^()]{1,180})\)", lead):
+        content = match.group(1).strip()
+        parts = re.split(r"\s+[\-–—]\s+", content, maxsplit=1)
+        if len(parts) != 2:
+            continue
+        birth_values = _date_values_from_text(parts[0], allow_bare_year=True)
+        death_values = _date_values_from_text(parts[1], allow_bare_year=True)
+        if len(birth_values) != 1 or len(death_values) != 1:
+            continue
+        pair = (birth_values[0], death_values[0], content)
+        if pair not in pairs:
+            pairs.append(pair)
+    return pairs
+
+
+def _explicit_body_age_hits(text: str) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int, int]]]:
+    """Find explicit singular ages and ranges without scanning arbitrary numbers."""
+
+    range_hits: list[tuple[int, int, int, int]] = []
+    range_pattern = re.compile(
+        r"\b(?:aged|at\s+(?:the\s+)?age\s+(?:of\s+)?)\s*"
+        r"(\d{1,3})\s*(?:or|to|[-–—])\s*(\d{1,3})\b",
+        flags=re.I,
+    )
+    for match in range_pattern.finditer(text):
+        low, high = int(match.group(1)), int(match.group(2))
+        if 0 <= low <= 125 and 0 <= high <= 125:
+            range_hits.append((match.start(), match.end(), low, high))
+
+    singular_hits: list[tuple[int, int, int]] = []
+    patterns = (
+        re.compile(
+            r"\b(?:aged|at\s+(?:the\s+)?age\s+(?:of\s+)?)\s*(\d{1,3})\b",
+            flags=re.I,
+        ),
+        re.compile(
+            r"\b(?:died|dead)\s+(?:at\s+)?(?:the\s+age\s+of\s+|age\s+)?"
+            r"(\d{1,3})\b",
+            flags=re.I,
+        ),
+        re.compile(r"\b(\d{1,3})\s*(?:years?|yrs?)\s*old\b", flags=re.I),
+        re.compile(r"\b(?:was|is)\s+(?:just\s+)?(\d{1,3})(?!\d)", flags=re.I),
+    )
+    seen_spans: set[tuple[int, int, int]] = set()
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            age = int(match.group(1))
+            hit = (match.start(), match.end(), age)
+            if not 0 <= age <= 125 or hit in seen_spans:
+                continue
+            if any(
+                match.start() < right and match.end() > left
+                for left, right, _, _ in range_hits
+            ):
+                continue
+            seen_spans.add(hit)
+            singular_hits.append(hit)
+    singular_hits.sort()
+    return singular_hits, range_hits
+
+
+def _scan_ambiguous_article(
+    person: Mapping[str, Any], article: Mapping[str, Any], packet: Mapping[str, Any]
+) -> dict[str, Any]:
+    raw = str(article["raw_wikitext"])
+    infobox_raw, _ = _balanced_template(raw, r"\{\{\s*Infobox\b")
+    fields = _infobox_fields(infobox_raw) if infobox_raw else {}
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def add(candidate: dict[str, Any]) -> None:
+        key = (
+            candidate["kind"],
+            candidate.get("source"),
+            candidate.get("value"),
+            candidate.get("excerpt"),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        candidate["candidate_id"] = f"C{len(candidates) + 1:03d}"
+        candidates.append(candidate)
+
+    infobox_subject_text = " ".join(
+        clean_wikitext(_without_reference_metadata(value))
+        for value in fields.values()
+    )
+    explicit_infobox_ages: list[int] = []
+    age_range_spans: list[tuple[int, int]] = []
+    for match in re.finditer(
+        r"\b(?:aged|age\s+at\s+death|death[_ ]age)\s*(?:=|:)?\s*"
+        r"(\d{1,3})\s*(?:or|to|[-–—])\s*(\d{1,3})\b",
+        infobox_subject_text,
+        flags=re.I,
+    ):
+        low, high = int(match.group(1)), int(match.group(2))
+        if not 0 <= low <= 125 or not 0 <= high <= 125:
+            continue
+        age_range_spans.append(match.span())
+        explicit_infobox_ages.extend((low, high))
+        add(
+            {
+                "kind": "age_range",
+                "source": "infobox",
+                "value": f"{low}-{high}",
+                "excerpt": clean_wikitext(match.group(0)),
+                "requires_semantic_review": False,
+                "deterministic_claim_type": "other",
+                "reason": "Infobox states an age range rather than one canonical age.",
+            }
+        )
+    for match in re.finditer(
+        r"\b(?:aged|age\s+at\s+death|death[_ ]age)\s*(?:=|:)?\s*(\d{1,3})\b",
+        infobox_subject_text,
+        flags=re.I,
+    ):
+        age = int(match.group(1))
+        if not 0 <= age <= 125 or any(
+            left <= match.start() < right for left, right in age_range_spans
+        ):
+            continue
+        explicit_infobox_ages.append(age)
+        add(
+            {
+                "kind": "age",
+                "source": "infobox",
+                "value": age,
+                "excerpt": _sentence_context_excerpt(
+                    infobox_subject_text, match.start(), match.end(), preceding=1, following=1
+                ),
+                "requires_semantic_review": False,
+                "deterministic_claim_type": "age_at_death",
+                "reason": "Explicit infobox age-at-death wording.",
+            }
+        )
+    for template in _iter_wikitext_templates(infobox_raw):
+        name, positional, _ = _template_parameters(template)
+        if name.startswith("death date and given age") and len(positional) >= 4:
+            age_text = positional[3].strip()
+            if age_text.isdigit() and 0 <= int(age_text) <= 125:
+                age = int(age_text)
+                explicit_infobox_ages.append(age)
+                add(
+                    {
+                        "kind": "age",
+                        "source": "infobox",
+                        "value": age,
+                        "excerpt": clean_wikitext(template),
+                        "requires_semantic_review": False,
+                        "deterministic_claim_type": "age_at_death",
+                        "reason": "Infobox death-date-and-given-age template supplies one explicit age.",
+                    }
+                )
+            continue
+        if not name.startswith(("death date and age", "dda")) or len(positional) < 6:
+            continue
+        death_values = _template_date_values(template, "death_date")
+        birth_values = _template_date_values(template, "birth_date")
+        if len(death_values) == len(birth_values) == 1:
+            low, high = _age_bounds(birth_values[0], death_values[0])
+            if low == high and 0 <= low <= 125:
+                explicit_infobox_ages.append(low)
+                add(
+                    {
+                        "kind": "age",
+                        "source": "infobox",
+                        "value": low,
+                        "excerpt": clean_wikitext(template),
+                        "requires_semantic_review": False,
+                        "deterministic_claim_type": "age_at_death",
+                        "reason": "Infobox death-date-and-age template deterministically renders one age.",
+                    }
+                )
+            elif 0 <= low <= high <= 125:
+                explicit_infobox_ages.extend((low, high))
+                add(
+                    {
+                        "kind": "age_range",
+                        "source": "infobox",
+                        "value": f"{low}-{high}",
+                        "excerpt": clean_wikitext(template),
+                        "requires_semantic_review": False,
+                        "deterministic_claim_type": "other",
+                        "reason": "Infobox death-date-and-age template renders an ambiguous age range.",
+                    }
+                )
+
+    body = _visible_article_body(raw)
+    body_age_hits, body_age_ranges = _explicit_body_age_hits(body)
+    for start, end, low, high in body_age_ranges:
+        add(
+            {
+                "kind": "age_range",
+                "source": "article_body",
+                "value": f"{low}-{high}",
+                "excerpt": _sentence_context_excerpt(body, start, end),
+                "requires_semantic_review": False,
+                "deterministic_claim_type": "other",
+                "reason": "Article prose states an age range rather than one singular age.",
+            }
+        )
+    for start, end, age in body_age_hits:
+        add(
+            {
+                "kind": "age",
+                "source": "article_body",
+                "value": age,
+                "excerpt": _sentence_context_excerpt(body, start, end),
+                "requires_semantic_review": True,
+            }
+        )
+    for title in _citation_titles(raw):
+        for match in re.finditer(r"(?<!\d)(26|27|28)(?!\d)", title):
+            add(
+                {
+                    "kind": "age",
+                    "source": "citation_title",
+                    "value": int(match.group(1)),
+                    "excerpt": title,
+                    "requires_semantic_review": True,
+                }
+            )
+
+    existing_precision = {
+        field: max((_date_precision(value) for value in split_values(person[field])), default=0)
+        for field in ("birth_date", "death_date")
+    }
+    for field in ("birth_date", "death_date"):
+        raw_value = fields.get(field.replace("_", " "), "") or fields.get(field, "")
+        field_values = _date_values_from_field(raw_value, field)
+        field_template_names = {
+            _template_parameters(template)[0]
+            for template in _iter_wikitext_templates(
+                _without_reference_metadata(raw_value)
+            )
+        }
+        structured_field = any(
+            name.startswith(("birth date", "bda"))
+            or name
+            in (
+                STANDARD_DEATH_DATE_TEMPLATES
+                | STANDARD_DEATH_YEAR_TEMPLATES
+                | GIVEN_AGE_DATE_TEMPLATES
+                | TEXT_DEATH_DATE_TEMPLATES
+            )
+            for name in field_template_names
+        )
+        for value in field_values:
+            if _date_precision(value) < existing_precision[field]:
+                continue
+            add(
+                {
+                    "kind": "date",
+                    "source": "infobox",
+                    "value": value,
+                    "precision": _date_precision(value),
+                    "excerpt": (
+                        value
+                        if structured_field and len(field_values) == 1
+                        else clean_wikitext(_without_reference_metadata(raw_value))
+                    ),
+                    "requires_semantic_review": False,
+                    "deterministic_claim_type": field,
+                    "reason": "Explicit labeled infobox date with equal or better precision than Wikidata.",
+                }
+            )
+
+    for birth, death, excerpt in _lead_lifespan_date_pairs(packet):
+        for field, value in (("birth_date", birth), ("death_date", death)):
+            if _date_precision(value) < existing_precision[field]:
+                continue
+            add(
+                {
+                    "kind": "date",
+                    "source": "lead",
+                    "value": value,
+                    "precision": _date_precision(value),
+                    "excerpt": excerpt,
+                    "requires_semantic_review": False,
+                    "deterministic_claim_type": field,
+                    "reason": "Conventional parenthetical lead lifespan supplies a role-labeled date.",
+                }
+            )
+
+    lead = str(packet.get("lead_sentence", "")).strip()
+    for value in _date_values_from_text(lead, allow_bare_year=True):
+        if _date_precision(value) < min(existing_precision.values() or [0]):
+            continue
+        add(
+            {
+                "kind": "date",
+                "source": "lead",
+                "value": value,
+                "precision": _date_precision(value),
+                "excerpt": lead,
+                "requires_semantic_review": True,
+            }
+        )
+
+    unique_infobox_ages = sorted(set(explicit_infobox_ages))
+    return {
+        "schema_version": 1,
+        "lane": "ambiguous_members",
+        "wikidata_id": person["wikidata_id"],
+        "name": person["name"],
+        "article_url": article["article_url"],
+        "revision_id": article["revision_id"],
+        "member_classes": person["member_classes"],
+        "age_status": person["age_status"],
+        "wikidata_birth_dates": split_values(person["birth_date"]),
+        "wikidata_death_dates": split_values(person["death_date"]),
+        "source_row_sha256": person["source_row_sha256"],
+        "canonical_infobox_age": (
+            unique_infobox_ages[0] if len(unique_infobox_ages) == 1 else None
+        ),
+        "ambiguous_infobox_ages": (
+            unique_infobox_ages if len(unique_infobox_ages) > 1 else []
+        ),
+        "candidates": candidates,
+        "semantic_candidate_ids": [
+            candidate["candidate_id"]
+            for candidate in candidates
+            if candidate["requires_semantic_review"]
+        ],
+        "pending_semantic_candidate_ids": [
+            candidate["candidate_id"]
+            for candidate in candidates
+            if candidate["requires_semantic_review"]
+        ],
+        "reused_candidate_reviews": [],
+    }
+
+
+def scan_ambiguous_members(
+    *, cohort_value: Path, cache_root: Path
+) -> dict[str, Any]:
+    run_dir, cohort = _require_ambiguous_cohort(cohort_value)
+    candidate_root = run_dir / "ambiguity" / "candidates"
+    counts = {"members": 0, "candidates": 0, "semantic_members": 0, "no_hits": 0}
+    for person in cohort["selected"]:
+        qid = person["wikidata_id"]
+        article_path = cache_root / "articles" / f"{qid}.json"
+        packet_path = run_dir / "packets" / f"{qid}.json"
+        if not article_path.exists() or not packet_path.exists():
+            raise BatchError(f"Missing article/packet for {qid}; run fetch and packetize first")
+        article = json.loads(article_path.read_text(encoding="utf-8"))
+        packet = json.loads(packet_path.read_text(encoding="utf-8"))
+        record = _scan_ambiguous_article(person, article, packet)
+        atomic_write_json(candidate_root / f"{qid}.json", record)
+        counts["members"] += 1
+        counts["candidates"] += len(record["candidates"])
+        if record["semantic_candidate_ids"]:
+            counts["semantic_members"] += 1
+        if not record["candidates"]:
+            counts["no_hits"] += 1
+    atomic_write_json(run_dir / "ambiguity" / "scan-stats.json", counts)
+    cohort["stages"]["ambiguity_scan_complete_utc"] = utc_now()
+    atomic_write_json(run_dir / "cohort.json", cohort)
+    return counts
+
+
+def _ambiguous_candidate_fingerprint(candidate: Mapping[str, Any]) -> str:
+    payload = {
+        key: candidate.get(key)
+        for key in ("kind", "source", "value", "excerpt")
+    }
+    return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
+
+
+def _semantic_reuse_safe(
+    candidate: Mapping[str, Any], review: Mapping[str, Any]
+) -> bool:
+    if review.get("verdict") == "ambiguous" or candidate.get("source") == "citation_title":
+        return False
+    if candidate.get("kind") == "age" and review.get("verdict") == "rejected":
+        age = re.escape(str(candidate.get("value", "")))
+        if re.search(
+            rf"\b(?:he|she|they|[A-Z][\w’'-]+)\s+was\s+(?:just\s+)?{age}\b",
+            str(candidate.get("excerpt", "")),
+            flags=re.I,
+        ):
+            return False
+    return True
+
+
+def reuse_ambiguous_reviews(
+    *, cohort_value: Path, state_path: Path, source_cohort: Path | None = None
+) -> dict[str, int]:
+    """Reuse only unchanged, non-ambiguous semantic decisions from prior runs."""
+
+    run_dir, cohort = _require_ambiguous_cohort(cohort_value)
+    if "ambiguity_scan_complete_utc" not in cohort.get("stages", {}):
+        raise BatchError("Run scan-ambiguous before reusing prior reviews")
+    state = _load_ambiguous_state(state_path)
+    counts = {
+        "members": len(cohort["selected"]),
+        "members_fully_reused": 0,
+        "members_partially_reused": 0,
+        "candidate_reviews_reused": 0,
+        "semantic_members_pending": 0,
+    }
+    for person in cohort["selected"]:
+        qid = person["wikidata_id"]
+        record = _ambiguous_candidate_record(run_dir, qid)
+        semantic_output = _ambiguous_semantic_path(run_dir, qid)
+        if semantic_output.exists():
+            semantic_output.unlink()
+        all_ids = list(record["semantic_candidate_ids"])
+        if not all_ids:
+            continue
+        previous_state = state["members"].get(qid, {})
+        previous_run = source_cohort or Path(
+            str(previous_state.get("source_run_dir", ""))
+        )
+        old_record_path = previous_run / "ambiguity" / "candidates" / f"{qid}.json"
+        old_semantic_path = previous_run / "ambiguity" / "semantic" / f"{qid}.json"
+        reusable_by_fingerprint: dict[str, dict[str, Any]] = {}
+        reusable_by_key: dict[tuple[Any, ...], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+        if old_record_path.exists() and old_semantic_path.exists():
+            try:
+                old_record = _ambiguous_candidate_record(previous_run, qid)
+                old_semantic = _validate_ambiguous_semantic_result(
+                    previous_run,
+                    qid,
+                    json.loads(old_semantic_path.read_text(encoding="utf-8")),
+                )
+            except (BatchError, json.JSONDecodeError, OSError):
+                old_record = {}
+                old_semantic = {"candidate_reviews": []}
+            old_candidates = {
+                candidate["candidate_id"]: candidate
+                for candidate in old_record.get("candidates", [])
+            }
+            for review in old_semantic["candidate_reviews"]:
+                candidate = old_candidates.get(review["candidate_id"])
+                if candidate and (
+                    source_cohort is not None
+                    or _semantic_reuse_safe(candidate, review)
+                ):
+                    reusable_by_fingerprint[
+                        _ambiguous_candidate_fingerprint(candidate)
+                    ] = review
+                    key = (
+                        candidate.get("kind"),
+                        candidate.get("source"),
+                        candidate.get("value"),
+                    )
+                    reusable_by_key.setdefault(key, []).append((candidate, review))
+
+        new_by_key: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for candidate in record["candidates"]:
+            if candidate["candidate_id"] not in all_ids:
+                continue
+            key = (
+                candidate.get("kind"),
+                candidate.get("source"),
+                candidate.get("value"),
+            )
+            new_by_key.setdefault(key, []).append(candidate)
+        ordinal_reuse: dict[str, dict[str, Any]] = {}
+        for key, new_candidates in new_by_key.items():
+            old_candidates = reusable_by_key.get(key, [])
+            if len(old_candidates) != len(new_candidates):
+                continue
+            for new_candidate, (_, old_review) in zip(new_candidates, old_candidates):
+                if source_cohort is not None or _semantic_reuse_safe(
+                    new_candidate, old_review
+                ):
+                    ordinal_reuse[new_candidate["candidate_id"]] = old_review
+
+        reused: list[dict[str, Any]] = []
+        pending: list[str] = []
+        for candidate in record["candidates"]:
+            candidate_id = candidate["candidate_id"]
+            if candidate_id not in all_ids:
+                continue
+            old_review = reusable_by_fingerprint.get(
+                _ambiguous_candidate_fingerprint(candidate)
+            ) or ordinal_reuse.get(candidate_id)
+            if old_review is None:
+                pending.append(candidate_id)
+                continue
+            reused.append({**old_review, "candidate_id": candidate_id})
+        record["pending_semantic_candidate_ids"] = pending
+        record["reused_candidate_reviews"] = reused
+        atomic_write_json(
+            run_dir / "ambiguity" / "candidates" / f"{qid}.json", record
+        )
+        counts["candidate_reviews_reused"] += len(reused)
+        if pending:
+            counts["semantic_members_pending"] += 1
+            if reused:
+                counts["members_partially_reused"] += 1
+        else:
+            combined = {
+                "schema_version": 1,
+                "wikidata_id": qid,
+                "candidate_reviews": reused,
+                "reason": "All semantic decisions were reused from unchanged prior evidence.",
+            }
+            normalized = _validate_ambiguous_semantic_result(run_dir, qid, combined)
+            atomic_write_json(semantic_output, normalized)
+            counts["members_fully_reused"] += 1
+    atomic_write_json(run_dir / "ambiguity" / "reuse-stats.json", counts)
+    cohort["stages"]["ambiguity_reuse_complete_utc"] = utc_now()
+    atomic_write_json(run_dir / "cohort.json", cohort)
+    return counts
+
+
 def packetize_articles(*, cohort_value: Path, cache_root: Path) -> dict[str, int]:
     run_dir, cohort = cohort_paths(cohort_value)
     packet_root = run_dir / "packets"
@@ -1134,7 +2527,7 @@ SEMANTIC_ROLES = (
 )
 TASK_STATES = {"running", "failed"}
 SCHEDULER_ROLES = (*SEMANTIC_ROLES, "vocabulary")
-MAX_SEMANTIC_SLOTS = 3
+MAX_SEMANTIC_SLOTS = 6
 APPROVAL_TRANCHE_SIZE = 100
 MAX_TASK_ATTEMPTS = 3  # initial assignment plus two diagnosed recoveries
 ASSIGNMENT_LIMITS = {
@@ -4821,6 +6214,891 @@ def verify_batch(
     return result
 
 
+def _ambiguous_scheduler_state(run_dir: Path) -> dict[str, Any]:
+    path = run_dir / "ambiguity" / "scheduler" / "state.json"
+    if not path.exists():
+        return {
+            "schema_version": 1,
+            "next_assignment": 1,
+            "active_leases": {},
+            "attempts": {},
+            "completed_assignments": [],
+        }
+    value = json.loads(path.read_text(encoding="utf-8"))
+    required = {
+        "schema_version",
+        "next_assignment",
+        "active_leases",
+        "attempts",
+        "completed_assignments",
+    }
+    if not isinstance(value, dict) or set(value) != required or value["schema_version"] != 1:
+        raise BatchError("Invalid ambiguous-member scheduler state")
+    return value
+
+
+def _ambiguous_exceptions(run_dir: Path) -> dict[str, dict[str, Any]]:
+    path = run_dir / "ambiguity" / "scheduler" / "exceptions.json"
+    if not path.exists():
+        return {}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise BatchError("Invalid ambiguous-member exception lane")
+    return value
+
+
+def _ambiguous_candidate_record(run_dir: Path, qid: str) -> dict[str, Any]:
+    path = run_dir / "ambiguity" / "candidates" / f"{qid}.json"
+    if not path.exists():
+        raise BatchError(f"Missing ambiguous-member scan for {qid}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if value.get("schema_version") != 1 or value.get("wikidata_id") != qid:
+        raise BatchError(f"Invalid ambiguous-member scan for {qid}")
+    return value
+
+
+def _ambiguous_semantic_path(run_dir: Path, qid: str) -> Path:
+    return run_dir / "ambiguity" / "semantic" / f"{qid}.json"
+
+
+def build_ambiguous_role_input(
+    *, cohort_value: Path, qid: str, output: Path | None = None
+) -> Path:
+    run_dir, cohort = _require_ambiguous_cohort(cohort_value)
+    person = next(
+        (item for item in cohort["selected"] if item["wikidata_id"] == qid), None
+    )
+    if person is None:
+        raise BatchError(f"QID is outside ambiguous-member cohort: {qid}")
+    record = _ambiguous_candidate_record(run_dir, qid)
+    semantic_ids = set(
+        record.get("pending_semantic_candidate_ids", record["semantic_candidate_ids"])
+    )
+    if not semantic_ids:
+        raise BatchError(f"{qid} has no candidates requiring semantic review")
+    payload = {
+        "schema_version": 1,
+        "role": "ambiguous-member-review",
+        "wikidata_id": qid,
+        "name": person["name"],
+        "article_url": record["article_url"],
+        "revision_id": record["revision_id"],
+        "member_classes": person["member_classes"],
+        "existing": {
+            "age_status": person["age_status"],
+            "birth_dates": split_values(person["birth_date"]),
+            "death_dates": split_values(person["death_date"]),
+        },
+        "policy": {
+            "age_numbers": [26, 27, 28],
+            "age_question": "Does this exact excerpt explicitly state the subject's age at death?",
+            "date_question": "Does this exact lead excerpt explicitly give the subject's birth or death date?",
+            "do_not_infer": True,
+            "canonical_infobox_age": record["canonical_infobox_age"],
+        },
+        "candidates": [
+            candidate
+            for candidate in record["candidates"]
+            if candidate["candidate_id"] in semantic_ids
+        ],
+    }
+    output = output or run_dir / "ambiguity" / "inputs" / f"{qid}.json"
+    atomic_write_json(output, payload)
+    return output
+
+
+def _validate_ambiguous_semantic_result(
+    run_dir: Path,
+    qid: str,
+    value: Mapping[str, Any],
+    *,
+    expected_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    record = _ambiguous_candidate_record(run_dir, qid)
+    required = {"schema_version", "wikidata_id", "candidate_reviews", "reason"}
+    if set(value) != required or value.get("schema_version") != 1:
+        raise BatchError(f"{qid}: malformed ambiguous-member semantic result")
+    if value.get("wikidata_id") != qid:
+        raise BatchError(f"{qid}: semantic result QID mismatch")
+    if not isinstance(value.get("reason"), str) or not str(value["reason"]).strip():
+        raise BatchError(f"{qid}: blank semantic review reason")
+    reviews = value.get("candidate_reviews")
+    if not isinstance(reviews, list) or any(not isinstance(item, dict) for item in reviews):
+        raise BatchError(f"{qid}: candidate_reviews must be an array")
+    expected = set(expected_ids or record["semantic_candidate_ids"])
+    received = [str(item.get("candidate_id", "")) for item in reviews]
+    if set(received) != expected or len(received) != len(set(received)):
+        raise BatchError(f"{qid}: semantic result must review every candidate exactly once")
+    candidate_by_id = {item["candidate_id"]: item for item in record["candidates"]}
+    normalized = []
+    for item in reviews:
+        if set(item) != {"candidate_id", "verdict", "claim_type", "reason"}:
+            raise BatchError(f"{qid}: malformed candidate review")
+        candidate_id = str(item["candidate_id"])
+        verdict = str(item["verdict"])
+        claim_type = str(item["claim_type"])
+        reason = str(item["reason"]).strip()
+        candidate = candidate_by_id[candidate_id]
+        if verdict not in AMBIGUOUS_VERDICTS or claim_type not in AMBIGUOUS_CLAIM_TYPES:
+            raise BatchError(f"{qid}: invalid verdict or claim type for {candidate_id}")
+        if not reason:
+            raise BatchError(f"{qid}: blank reason for {candidate_id}")
+        if candidate["kind"] == "age" and claim_type not in {"age_at_death", "other"}:
+            raise BatchError(f"{qid}: age candidate has incompatible claim type")
+        if candidate["kind"] == "date" and claim_type not in {
+            "birth_date",
+            "death_date",
+            "other",
+        }:
+            raise BatchError(f"{qid}: date candidate has incompatible claim type")
+        if verdict == "confirmed" and claim_type == "other":
+            raise BatchError(f"{qid}: confirmed candidate cannot have claim_type other")
+        normalized.append(
+            {
+                "candidate_id": candidate_id,
+                "verdict": verdict,
+                "claim_type": claim_type,
+                "reason": reason,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "wikidata_id": qid,
+        "candidate_reviews": normalized,
+        "reason": str(value["reason"]).strip(),
+    }
+
+
+def ambiguous_scheduler_status(*, cohort_value: Path) -> dict[str, Any]:
+    run_dir, cohort = _require_ambiguous_cohort(cohort_value)
+    if "ambiguity_scan_complete_utc" not in cohort.get("stages", {}):
+        raise BatchError("Run scan-ambiguous before querying its scheduler")
+    state = _ambiguous_scheduler_state(run_dir)
+    exceptions = _ambiguous_exceptions(run_dir)
+    active_qids = {
+        qid
+        for lease in state["active_leases"].values()
+        for qid in lease.get("qids", [])
+    }
+    finalized_qids: set[str] = set()
+    finalized_tranches: set[int] = set()
+    for path in sorted((run_dir / "ambiguity" / "reviews").glob("tranche-*.json")):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        finalized_qids.update(str(qid) for qid in manifest.get("finalized_qids", []))
+        finalized_tranches.add(int(manifest["tranche"]))
+    ready_items: list[str] = []
+    tranches: dict[int, dict[str, Any]] = {}
+    remaining = 0
+    for person in cohort["selected"]:
+        qid = person["wikidata_id"]
+        number = int(person["approval_tranche"])
+        tranche = tranches.setdefault(
+            number,
+            {
+                "tranche": number,
+                "total": 0,
+                "deterministic_only": 0,
+                "semantic_complete": 0,
+                "exceptions": 0,
+                "pending": 0,
+                "finalized": 0,
+            },
+        )
+        tranche["total"] += 1
+        if qid in finalized_qids:
+            tranche["finalized"] += 1
+            continue
+        record = _ambiguous_candidate_record(run_dir, qid)
+        if qid in exceptions:
+            tranche["exceptions"] += 1
+            continue
+        semantic_ids = record.get(
+            "pending_semantic_candidate_ids", record["semantic_candidate_ids"]
+        )
+        if not semantic_ids:
+            tranche["deterministic_only"] += 1
+            continue
+        if _ambiguous_semantic_path(run_dir, qid).exists():
+            tranche["semantic_complete"] += 1
+            continue
+        tranche["pending"] += 1
+        remaining += 1
+        if qid not in active_qids and int(state["attempts"].get(qid, 0)) < MAX_TASK_ATTEMPTS:
+            ready_items.append(qid)
+    for tranche in tranches.values():
+        tranche["reviewable"] = (
+            tranche["pending"] == 0
+            and tranche["tranche"] not in finalized_tranches
+        )
+    usage_path = run_dir / "ambiguity" / "scheduler" / "usage.json"
+    usage = json.loads(usage_path.read_text(encoding="utf-8")) if usage_path.exists() else []
+    return {
+        "lane": "ambiguous_members",
+        "cohort": str(run_dir),
+        "slot_limit": MAX_SEMANTIC_SLOTS,
+        "active_leases": state["active_leases"],
+        "ready_count": len(ready_items),
+        "ready_items": ready_items,
+        "exceptions": list(exceptions.values()),
+        "tranches": [tranches[number] for number in sorted(tranches)],
+        "usage": usage,
+        "processing_remaining": remaining,
+        "processing_complete": remaining == 0 and not state["active_leases"],
+        "completion_scope": "frozen_ambiguous_cohort_only",
+    }
+
+
+def claim_ambiguous_assignment(*, cohort_value: Path, slot: int) -> dict[str, Any]:
+    if slot not in range(1, MAX_SEMANTIC_SLOTS + 1):
+        raise BatchError(f"Slot must be 1..{MAX_SEMANTIC_SLOTS}")
+    run_dir, _ = _require_ambiguous_cohort(cohort_value)
+    state = _ambiguous_scheduler_state(run_dir)
+    slot_key = str(slot)
+    if slot_key in state["active_leases"]:
+        raise BatchError(f"Slot {slot} already has an active lease")
+    if len(state["active_leases"]) >= MAX_SEMANTIC_SLOTS:
+        raise BatchError("All semantic slots are leased")
+    status = ambiguous_scheduler_status(cohort_value=cohort_value)
+    packed: list[dict[str, Any]] = []
+    total_bytes = 0
+    for qid in status["ready_items"]:
+        input_path = build_ambiguous_role_input(cohort_value=cohort_value, qid=qid)
+        size = input_path.stat().st_size
+        if packed and (
+            len(packed) >= AMBIGUOUS_ASSIGNMENT_LIMITS["max_items"]
+            or total_bytes + size > AMBIGUOUS_ASSIGNMENT_LIMITS["max_bytes"]
+        ):
+            break
+        packed.append(
+            {
+                "key": qid,
+                "input": str(input_path),
+                "input_bytes": size,
+                "oversize_singleton": not packed
+                and size > AMBIGUOUS_ASSIGNMENT_LIMITS["max_bytes"],
+            }
+        )
+        total_bytes += size
+        if size > AMBIGUOUS_ASSIGNMENT_LIMITS["max_bytes"]:
+            break
+    if not packed:
+        return {"assignment": None, **status}
+    assignment_id = f'AR{int(state["next_assignment"]):06d}'
+    manifest = {
+        "schema_version": 1,
+        "assignment_id": assignment_id,
+        "slot": slot,
+        "role": "ambiguous-member-review",
+        "prompt": str(PROJECT_DIR / "semantic-prompts" / "ambiguous-member-review.md"),
+        "items": packed,
+        "input_bytes": total_bytes,
+        "max_input_bytes": AMBIGUOUS_ASSIGNMENT_LIMITS["max_bytes"],
+        "max_items": AMBIGUOUS_ASSIGNMENT_LIMITS["max_items"],
+        "result_format": "JSON array containing exactly one result object per item",
+        "claimed_utc": utc_now(),
+    }
+    manifest_path = (
+        run_dir / "ambiguity" / "scheduler" / "assignments" / f"{assignment_id}.json"
+    )
+    atomic_write_json(manifest_path, manifest)
+    qids = [item["key"] for item in packed]
+    for qid in qids:
+        state["attempts"][qid] = int(state["attempts"].get(qid, 0)) + 1
+    state["next_assignment"] += 1
+    state["active_leases"][slot_key] = {
+        "assignment_id": assignment_id,
+        "manifest": str(manifest_path),
+        "qids": qids,
+    }
+    atomic_write_json(run_dir / "ambiguity" / "scheduler" / "state.json", state)
+    return {"assignment": str(manifest_path), **manifest}
+
+
+def complete_ambiguous_assignment(
+    *,
+    cohort_value: Path,
+    assignment_id: str,
+    input_path: Path | None,
+    failed_reason: str = "",
+    recorded_input_tokens: int | None = None,
+    recorded_output_tokens: int | None = None,
+) -> dict[str, Any]:
+    run_dir, _ = _require_ambiguous_cohort(cohort_value)
+    state = _ambiguous_scheduler_state(run_dir)
+    leases = [
+        (slot, lease)
+        for slot, lease in state["active_leases"].items()
+        if lease.get("assignment_id") == assignment_id
+    ]
+    if len(leases) != 1:
+        raise BatchError(f"Assignment is not actively leased: {assignment_id}")
+    slot, lease = leases[0]
+    manifest = json.loads(Path(lease["manifest"]).read_text(encoding="utf-8"))
+    if any(
+        value is not None and value < 0
+        for value in (recorded_input_tokens, recorded_output_tokens)
+    ):
+        raise BatchError("Recorded token counts cannot be negative")
+    results: list[dict[str, Any]] = []
+    parse_error = ""
+    if input_path is not None:
+        try:
+            results = _load_assignment_result(input_path)
+        except (BatchError, json.JSONDecodeError, OSError) as exc:
+            parse_error = str(exc)
+    elif not failed_reason.strip():
+        raise BatchError("Completion requires --input or --failed-reason")
+    by_qid: dict[str, dict[str, Any]] = {}
+    duplicates: set[str] = set()
+    for result in results:
+        qid = str(result.get("wikidata_id", ""))
+        if qid in by_qid:
+            duplicates.add(qid)
+        else:
+            by_qid[qid] = result
+    expected = [item["key"] for item in manifest["items"]]
+    extras = sorted(set(by_qid) - set(expected))
+    installed: list[str] = []
+    failed: list[dict[str, Any]] = []
+    exceptions = _ambiguous_exceptions(run_dir)
+    for qid in expected:
+        reason = (
+            failed_reason.strip()
+            or parse_error
+            or (f"duplicate result key: {qid}" if qid in duplicates else "")
+            or "assignment omitted this item"
+        )
+        result = by_qid.get(qid)
+        if result is not None and qid not in duplicates and not parse_error:
+            try:
+                record = _ambiguous_candidate_record(run_dir, qid)
+                pending_ids = record.get(
+                    "pending_semantic_candidate_ids",
+                    record["semantic_candidate_ids"],
+                )
+                pending = _validate_ambiguous_semantic_result(
+                    run_dir, qid, result, expected_ids=pending_ids
+                )
+                normalized = _validate_ambiguous_semantic_result(
+                    run_dir,
+                    qid,
+                    {
+                        "schema_version": 1,
+                        "wikidata_id": qid,
+                        "candidate_reviews": [
+                            *record.get("reused_candidate_reviews", []),
+                            *pending["candidate_reviews"],
+                        ],
+                        "reason": pending["reason"],
+                    },
+                )
+            except BatchError as exc:
+                reason = str(exc)
+            else:
+                atomic_write_json(_ambiguous_semantic_path(run_dir, qid), normalized)
+                installed.append(qid)
+                continue
+        attempts = int(state["attempts"].get(qid, 0))
+        failure = {"key": qid, "reason": reason, "attempts": attempts}
+        failed.append(failure)
+        if attempts >= MAX_TASK_ATTEMPTS:
+            exceptions[qid] = {
+                "role": "ambiguous-member-review",
+                "key": qid,
+                "reason": reason,
+                "attempts": attempts,
+                "entered_utc": utc_now(),
+            }
+    state["active_leases"].pop(slot)
+    state["completed_assignments"].append(assignment_id)
+    atomic_write_json(run_dir / "ambiguity" / "scheduler" / "state.json", state)
+    atomic_write_json(run_dir / "ambiguity" / "scheduler" / "exceptions.json", exceptions)
+    usage_path = run_dir / "ambiguity" / "scheduler" / "usage.json"
+    usage = json.loads(usage_path.read_text(encoding="utf-8")) if usage_path.exists() else []
+    usage.append(
+        {
+            "assignment_id": assignment_id,
+            "items": len(expected),
+            "serialized_input_bytes": manifest["input_bytes"],
+            "result_bytes": input_path.stat().st_size if input_path and input_path.exists() else None,
+            "recorded_input_tokens": recorded_input_tokens,
+            "recorded_output_tokens": recorded_output_tokens,
+            "completed_utc": utc_now(),
+        }
+    )
+    atomic_write_json(usage_path, usage)
+    return {
+        "assignment_id": assignment_id,
+        "installed": installed,
+        "failed": failed,
+        "exceptions_added": [item for item in failed if item["key"] in exceptions],
+        "rejected_extra_keys": extras,
+        "slot_released": int(slot),
+    }
+
+
+def _best_unique_date(values: Sequence[str]) -> str:
+    valid = [value for value in values if _date_precision(value)]
+    if not valid:
+        return ""
+    precision = max(_date_precision(value) for value in valid)
+    best = sorted({value for value in valid if _date_precision(value) == precision})
+    return best[0] if len(best) == 1 else ""
+
+
+def _single_age_from_dates(birth: str, death: str) -> int | None:
+    if not birth or not death:
+        return None
+    low, high = _age_bounds(birth, death)
+    return low if low == high else None
+
+
+def _date_value_supports_age(birth: str, death: str, age: int) -> bool:
+    low, high = _age_bounds(birth, death)
+    return low <= age <= high
+
+
+def _assemble_ambiguous_review_row(
+    run_dir: Path, person: Mapping[str, Any]
+) -> dict[str, str] | None:
+    qid = str(person["wikidata_id"])
+    record = _ambiguous_candidate_record(run_dir, qid)
+    semantic: dict[str, Any] | None = None
+    semantic_path = _ambiguous_semantic_path(run_dir, qid)
+    if semantic_path.exists():
+        semantic = _validate_ambiguous_semantic_result(
+            run_dir, qid, json.loads(semantic_path.read_text(encoding="utf-8"))
+        )
+    reviews = {
+        item["candidate_id"]: item for item in (semantic or {}).get("candidate_reviews", [])
+    }
+    evidence: list[tuple[dict[str, Any], str]] = []
+    ambiguous_evidence: list[dict[str, Any]] = []
+    for candidate in record["candidates"]:
+        if not candidate["requires_semantic_review"]:
+            evidence.append((candidate, str(candidate["deterministic_claim_type"])))
+            continue
+        review = reviews.get(candidate["candidate_id"])
+        if review and review["verdict"] == "confirmed":
+            evidence.append((candidate, review["claim_type"]))
+        elif review and review["verdict"] == "ambiguous":
+            ambiguous_evidence.append(candidate)
+    if not evidence and not ambiguous_evidence:
+        return None
+
+    conflict_reasons: list[str] = []
+    material_conflicts: list[str] = []
+    canonical_age = record.get("canonical_infobox_age")
+    explicit_ages = sorted(
+        {
+            int(candidate["value"])
+            for candidate, claim_type in evidence
+            if claim_type == "age_at_death" and candidate["kind"] == "age"
+        }
+    )
+    confirmed_age: int | None = explicit_ages[0] if len(explicit_ages) == 1 else None
+
+    infobox_range = sorted({int(value) for value in record.get("ambiguous_infobox_ages", [])})
+    if infobox_range and confirmed_age is not None and not (
+        min(infobox_range) <= confirmed_age <= max(infobox_range)
+    ):
+        conflict_reasons.append(
+            "singular age differs from the non-singular infobox age range "
+            f"{min(infobox_range)}-{max(infobox_range)}"
+        )
+
+    recommended_dates: dict[str, str] = {"birth_date": "", "death_date": ""}
+    best_date_candidates: dict[str, list[str]] = {"birth_date": [], "death_date": []}
+    for field in ("birth_date", "death_date"):
+        current = record[f"wikidata_{field}s"]
+        minimum_precision = max((_date_precision(value) for value in current), default=0)
+        candidates = [
+            str(candidate["value"])
+            for candidate, claim_type in evidence
+            if claim_type == field and _date_precision(str(candidate["value"])) >= minimum_precision
+        ]
+        if candidates:
+            best_precision = max(_date_precision(value) for value in candidates)
+            best = sorted({value for value in candidates if _date_precision(value) == best_precision})
+            best_date_candidates[field] = best
+            if len(best) == 1:
+                recommended_dates[field] = best[0]
+
+    # A confirmed age can select a date alternative only when exactly one value
+    # remains compatible with the other field.
+    if confirmed_age is not None:
+        for field, other in (("birth_date", "death_date"), ("death_date", "birth_date")):
+            values = best_date_candidates[field]
+            if len(values) < 2:
+                continue
+            other_value = recommended_dates[other] or _best_unique_date(
+                record[f"wikidata_{other}s"]
+            )
+            if not other_value:
+                continue
+            compatible = [
+                value
+                for value in values
+                if _date_value_supports_age(
+                    value if field == "birth_date" else other_value,
+                    other_value if field == "birth_date" else value,
+                    confirmed_age,
+                )
+            ]
+            if len(compatible) == 1:
+                recommended_dates[field] = compatible[0]
+
+    for field in ("birth_date", "death_date"):
+        if len(best_date_candidates[field]) > 1 and not recommended_dates[field]:
+            reason = f"conflicting equal-precision Wikipedia {field} values"
+            conflict_reasons.append(reason)
+
+    birth_for_age = recommended_dates["birth_date"] or _best_unique_date(
+        record["wikidata_birth_dates"]
+    )
+    death_for_age = recommended_dates["death_date"] or _best_unique_date(
+        record["wikidata_death_dates"]
+    )
+    calculated_age = _single_age_from_dates(birth_for_age, death_for_age)
+    singular_ages = set(explicit_ages)
+    if calculated_age is not None:
+        singular_ages.add(calculated_age)
+    if len(singular_ages) == 1:
+        confirmed_age = next(iter(singular_ages))
+    elif len(singular_ages) > 1:
+        confirmed_age = None
+        reason = "conflicting singular age-at-death candidates: " + ", ".join(
+            str(age) for age in sorted(singular_ages)
+        )
+        conflict_reasons.append(reason)
+        material_conflicts.append(reason)
+
+    action = "none"
+    age_status = str(person["age_status"])
+    date_update = any(
+        (
+            recommended_dates[field]
+            and recommended_dates[field] not in record[f"wikidata_{field}s"]
+        )
+        or (
+            recommended_dates[field]
+            and len(record[f"wikidata_{field}s"]) > 1
+        )
+        for field in ("birth_date", "death_date")
+    )
+    if material_conflicts:
+        action = "review"
+    elif confirmed_age is not None and confirmed_age != 27:
+        action = "discard"
+    elif confirmed_age == 27 and age_status == "possible":
+        action = "elevate"
+    elif date_update:
+        action = "update"
+    if action not in AMBIGUOUS_ACTIONS:
+        raise BatchError(f"{qid}: invalid ambiguous-member action")
+
+    sources = []
+    excerpts = []
+    for candidate, _ in evidence:
+        source = str(candidate["source"])
+        excerpt = str(candidate["excerpt"])
+        if source not in sources:
+            sources.append(source)
+        if excerpt and excerpt not in excerpts:
+            excerpts.append(excerpt)
+    for candidate in ambiguous_evidence:
+        source = str(candidate["source"])
+        if source not in sources:
+            sources.append(source)
+        excerpt = str(candidate["excerpt"])
+        if excerpt and excerpt not in excerpts:
+            excerpts.append(excerpt)
+    reason_parts = []
+    if canonical_age is not None:
+        reason_parts.append("single explicit infobox age is canonical")
+    elif confirmed_age is not None:
+        reason_parts.append("explicit evidence or accepted dates establish one age")
+    if date_update:
+        reason_parts.append("Wikipedia supplies an equal-or-better-precision date update")
+    if conflict_reasons:
+        reason_parts.extend(conflict_reasons)
+    if not reason_parts:
+        reason_parts.append("evidence does not support a membership or date change")
+    return {
+        "wikidata_id": qid,
+        "name": str(person["name"]),
+        "article_url": str(record["article_url"]),
+        "revision_id": str(record["revision_id"]),
+        "member_classes": "; ".join(person["member_classes"]),
+        "existing_age_status": age_status,
+        "wikidata_birth_dates": "; ".join(record["wikidata_birth_dates"]),
+        "wikidata_death_dates": "; ".join(record["wikidata_death_dates"]),
+        "source_row_sha256": str(person["source_row_sha256"]),
+        "confirmed_age_at_death": "" if confirmed_age is None else str(confirmed_age),
+        "recommended_birth_date": recommended_dates["birth_date"],
+        "recommended_death_date": recommended_dates["death_date"],
+        "evidence_sources": "; ".join(sources),
+        "evidence_excerpts": " | ".join(excerpts),
+        "conflict": "; ".join(dict.fromkeys(conflict_reasons)),
+        "recommended_action": action,
+        "reason": "; ".join(reason_parts),
+        "reviewed_utc": utc_now(),
+        "source_run_dir": str(run_dir),
+    }
+
+
+def finalize_ambiguous_tranche(
+    *,
+    cohort_value: Path,
+    tranche: int,
+    review_csv: Path,
+    state_path: Path | None,
+) -> dict[str, Any]:
+    run_dir, cohort = _require_ambiguous_cohort(cohort_value)
+    state_path = state_path or Path(str(cohort["state_path"]))
+    status = ambiguous_scheduler_status(cohort_value=cohort_value)
+    tranche_status = next(
+        (item for item in status["tranches"] if item["tranche"] == tranche), None
+    )
+    if tranche_status is None:
+        raise BatchError(f"Unknown ambiguous-member tranche: {tranche}")
+    if not tranche_status["reviewable"]:
+        raise BatchError(f"Ambiguous-member tranche {tranche} is not reviewable")
+    exceptions = _ambiguous_exceptions(run_dir)
+    people = [
+        person
+        for person in cohort["selected"]
+        if int(person["approval_tranche"]) == tranche
+    ]
+    report_rows = [
+        row
+        for person in people
+        if person["wikidata_id"] not in exceptions
+        for row in [_assemble_ambiguous_review_row(run_dir, person)]
+        if row is not None
+    ]
+    if review_csv.exists():
+        fields, existing = read_csv(review_csv)
+        if fields != AMBIGUOUS_REVIEW_COLUMNS:
+            raise BatchError("Ambiguous-member review CSV schema mismatch")
+    else:
+        existing = []
+    finalized_qids = {person["wikidata_id"] for person in people if person["wikidata_id"] not in exceptions}
+    merged = [row for row in existing if row["wikidata_id"] not in finalized_qids]
+    merged.extend(report_rows)
+    merged.sort(key=lambda row: (row["name"].casefold(), row["wikidata_id"]))
+    atomic_write_csv(review_csv, AMBIGUOUS_REVIEW_COLUMNS, merged)
+
+    state = _load_ambiguous_state(state_path)
+    if (
+        state.get("schema_version") == 1
+        or state.get("review_policy_version") != AMBIGUOUS_REVIEW_POLICY_VERSION
+    ):
+        selected_qids = {person["wikidata_id"] for person in cohort["selected"]}
+        grandfathered = sorted(set(state["members"]) - selected_qids)
+        state["schema_version"] = 2
+        state["review_policy_version"] = AMBIGUOUS_REVIEW_POLICY_VERSION
+        state["grandfathered_completion_count"] = len(grandfathered)
+        state["grandfathered_completion_qids_sha256"] = hashlib.sha256(
+            "\n".join(grandfathered).encode()
+        ).hexdigest()
+    for person in people:
+        qid = person["wikidata_id"]
+        if qid in exceptions:
+            continue
+        record = _ambiguous_candidate_record(run_dir, qid)
+        state["members"][qid] = {
+            "source_row_sha256": person["source_row_sha256"],
+            "revision_id": record["revision_id"],
+            "outcome": "reported" if any(row["wikidata_id"] == qid for row in report_rows) else "no_reportable_evidence",
+            "reviewed_utc": utc_now(),
+            "source_run_dir": str(run_dir),
+            "review_policy_version": AMBIGUOUS_REVIEW_POLICY_VERSION,
+        }
+    atomic_write_json(state_path, state)
+    payload = {
+        "schema_version": 1,
+        "lane": "ambiguous_members",
+        "tranche": tranche,
+        "qids": [person["wikidata_id"] for person in people],
+        "finalized_qids": sorted(finalized_qids),
+        "exception_qids": sorted(set(exceptions) & {person["wikidata_id"] for person in people}),
+        "report_rows": report_rows,
+        "report_sha256": hashlib.sha256(canonical_json(report_rows).encode()).hexdigest(),
+        "review_csv": str(review_csv),
+        "state_path": str(state_path),
+        "created_utc": utc_now(),
+    }
+    manifest_path = run_dir / "ambiguity" / "reviews" / f"tranche-{tranche:03d}.json"
+    atomic_write_json(manifest_path, payload)
+    markdown = [
+        f"# Ambiguous-member Wikipedia review tranche {tranche}",
+        "",
+        f"Report hash: `{payload['report_sha256']}`",
+        "",
+        "| Name | Evidence | Age | Birth | Death | Action | Conflict |",
+        "|---|---|---:|---|---|---|---|",
+    ]
+    for row in report_rows:
+        markdown.append(
+            "| [{name}]({url}) | {sources} | {age} | {birth} | {death} | {action} | {conflict} |".format(
+                name=row["name"].replace("|", "\\|"),
+                url=row["article_url"],
+                sources=row["evidence_sources"].replace("|", "\\|"),
+                age=row["confirmed_age_at_death"],
+                birth=row["recommended_birth_date"],
+                death=row["recommended_death_date"],
+                action=row["recommended_action"],
+                conflict=row["conflict"].replace("|", "\\|"),
+            )
+        )
+    if payload["exception_qids"]:
+        markdown.extend(
+            ["", "Exceptions: " + ", ".join(payload["exception_qids"])]
+        )
+    atomic_write_text(manifest_path.with_suffix(".md"), "\n".join(markdown) + "\n")
+    return {
+        "tranche": tranche,
+        "finalized": len(finalized_qids),
+        "report_rows": len(report_rows),
+        "exceptions": len(payload["exception_qids"]),
+        "report_sha256": payload["report_sha256"],
+        "manifest": str(manifest_path),
+        "markdown": str(manifest_path.with_suffix(".md")),
+    }
+
+
+def verify_ambiguous_repair(
+    *,
+    cohort_value: Path,
+    manifest_path: Path,
+    original_review_csv: Path,
+    original_state_path: Path,
+    staged_review_csv: Path,
+    staged_state_path: Path,
+) -> dict[str, Any]:
+    manifest = _load_ambiguous_repair_manifest(manifest_path)
+    if hashlib.sha256(original_review_csv.read_bytes()).hexdigest() != manifest["report_sha256"]:
+        raise BatchError("Original ambiguous-member review CSV changed after repair freeze")
+    if hashlib.sha256(original_state_path.read_bytes()).hexdigest() != manifest["state_sha256"]:
+        raise BatchError("Original ambiguous-member state changed after repair freeze")
+    original_fields, original_rows = read_csv(original_review_csv)
+    staged_fields, staged_rows = read_csv(staged_review_csv)
+    if original_fields != AMBIGUOUS_REVIEW_COLUMNS or staged_fields != original_fields:
+        raise BatchError("Ambiguous-member repair CSV schema mismatch")
+    original_by_qid = {row["wikidata_id"]: row for row in original_rows}
+    staged_by_qid = {row["wikidata_id"]: row for row in staged_rows}
+    if len(original_by_qid) != len(original_rows) or len(staged_by_qid) != len(staged_rows):
+        raise BatchError("Duplicate QID in ambiguous-member repair CSV")
+    target_rows = _mixed_repair_targets(manifest)
+    target_qids = {item["wikidata_id"] for item in target_rows}
+    if (set(staged_by_qid) - set(original_by_qid)) - target_qids:
+        raise BatchError("Repair introduced an unlisted report QID")
+    preserved = manifest["preserved_report_rows"]
+    for qid, expected_hash in preserved.items():
+        row = staged_by_qid.get(qid)
+        if row is None or _ambiguous_review_row_sha256(row) != expected_hash:
+            raise BatchError(f"Repair changed an approved report row: {qid}")
+    changed_qids = {
+        qid
+        for qid in set(original_by_qid) | set(staged_by_qid)
+        if original_by_qid.get(qid) != staged_by_qid.get(qid)
+    }
+    if not changed_qids.issubset(target_qids):
+        raise BatchError("Repair changed a QID outside its target manifest")
+    if any(row["recommended_action"] not in AMBIGUOUS_ACTIONS for row in staged_rows):
+        raise BatchError("Repair produced an invalid recommended action")
+
+    original_state = _load_ambiguous_state(original_state_path)
+    staged_state = _load_ambiguous_state(staged_state_path)
+    for qid, value in original_state["members"].items():
+        if qid not in target_qids and staged_state["members"].get(qid) != value:
+            raise BatchError(f"Repair changed non-target completion state: {qid}")
+    status = ambiguous_scheduler_status(cohort_value=cohort_value)
+    if not status["processing_complete"] or status["active_leases"]:
+        raise BatchError("Ambiguous-member repair scheduler is not complete")
+    if status["exceptions"]:
+        raise BatchError("Ambiguous-member repair has unresolved exceptions")
+    if any(not tranche["finalized"] == tranche["total"] for tranche in status["tranches"]):
+        raise BatchError("Ambiguous-member repair has an unfinalized tranche")
+
+    if manifest.get("lane") == "ambiguous_members_mixed_repair":
+        if len(preserved) != 960 or len(manifest["preserved_state_members"]) != 1192:
+            raise BatchError("Mixed repair preservation count mismatch")
+        for item in target_rows:
+            qid = item["wikidata_id"]
+            original_state_entry = original_state["members"].get(qid)
+            if (
+                original_state_entry is None
+                or hashlib.sha256(canonical_json(original_state_entry).encode()).hexdigest()
+                != item["state_entry_sha256"]
+            ):
+                raise BatchError(f"Original mixed repair state target changed: {qid}")
+            original_report = original_by_qid.get(qid)
+            if item["target_class"] == "current_none":
+                if (
+                    original_report is None
+                    or original_report["recommended_action"] != "none"
+                    or _ambiguous_review_row_sha256(original_report) != item["report_row_sha256"]
+                ):
+                    raise BatchError(f"Original current-none repair target changed: {qid}")
+            elif original_report is not None or original_state_entry.get("outcome") != "no_reportable_evidence":
+                raise BatchError(f"Original grandfathered repair target changed: {qid}")
+        for qid, expected_hash in manifest["preserved_state_members"].items():
+            entry = staged_state["members"].get(qid)
+            if entry is None or hashlib.sha256(canonical_json(entry).encode()).hexdigest() != expected_hash:
+                raise BatchError(f"Repair changed protected state entry: {qid}")
+
+    deltas: dict[str, int] = {}
+    for qid in target_qids:
+        before = original_by_qid.get(qid, {}).get("recommended_action", "absent")
+        # An absent grandfathered row remains absent when the completed repair
+        # still has no reportable evidence; it was never a removable report row.
+        after = staged_by_qid.get(qid, {}).get(
+            "recommended_action", "absent" if before == "absent" else "removed"
+        )
+        key = f"{before}->{after}"
+        deltas[key] = deltas.get(key, 0) + 1
+    return {
+        "target_count": len(target_qids),
+        "changed_target_count": len(changed_qids),
+        "preserved_report_rows": len(preserved),
+        "preserved_state_members": len(original_state["members"]) - len(target_qids),
+        "staged_report_rows": len(staged_rows),
+        "action_deltas": dict(sorted(deltas.items())),
+    }
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(source.read_bytes())
+        os.replace(temp_name, destination)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def publish_ambiguous_repair(**kwargs: Any) -> dict[str, Any]:
+    verification = verify_ambiguous_repair(**kwargs)
+    _atomic_copy(kwargs["staged_review_csv"], kwargs["original_review_csv"])
+    _atomic_copy(kwargs["staged_state_path"], kwargs["original_state_path"])
+    verification["published_review_sha256"] = hashlib.sha256(
+        kwargs["original_review_csv"].read_bytes()
+    ).hexdigest()
+    verification["published_state_sha256"] = hashlib.sha256(
+        kwargs["original_state_path"].read_bytes()
+    ).hexdigest()
+    return verification
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--people-csv", type=Path, default=PEOPLE_CSV)
@@ -4846,6 +7124,39 @@ def build_parser() -> argparse.ArgumentParser:
     select.add_argument("--target-manifest", type=Path)
     select.add_argument("--removed-csv", type=Path, default=REMOVED_ENTRIES_CSV)
 
+    ambiguous_status_parser = subparsers.add_parser(
+        "ambiguous-status",
+        help="Read-only count of live possible or multi-date ambiguous members",
+    )
+    ambiguous_status_parser.add_argument("--limit", type=int, default=3)
+    ambiguous_status_parser.add_argument("--state", type=Path)
+    ambiguous_status_parser.add_argument("--rescan-all", action="store_true")
+
+    ambiguous_select = subparsers.add_parser(
+        "select-ambiguous",
+        help="Freeze the independent ambiguous-member Wikipedia review lane",
+    )
+    ambiguous_select.add_argument("--batch-size", type=int)
+    ambiguous_select.add_argument("--run-dir", type=Path)
+    ambiguous_select.add_argument("--state", type=Path)
+    ambiguous_select.add_argument("--rescan-all", action="store_true")
+    ambiguous_select.add_argument("--target-manifest", type=Path)
+    ambiguous_select.add_argument(
+        "--review-csv", type=Path, default=AMBIGUOUS_REVIEW_CSV
+    )
+
+    ambiguous_prepare_repair = subparsers.add_parser(
+        "prepare-ambiguous-repair",
+        help="Freeze an exact action-scoped ambiguous-member repair manifest",
+    )
+    ambiguous_prepare_repair.add_argument(
+        "--review-csv", type=Path, default=AMBIGUOUS_REVIEW_CSV
+    )
+    ambiguous_prepare_repair.add_argument("--state", type=Path)
+    ambiguous_prepare_repair.add_argument("--action", choices=sorted(AMBIGUOUS_ACTIONS), required=True)
+    ambiguous_prepare_repair.add_argument("--expected-count", type=int, required=True)
+    ambiguous_prepare_repair.add_argument("--output", type=Path, required=True)
+
     fetch = subparsers.add_parser("fetch", help="Bulk-fetch/cache current articles")
     fetch.add_argument("--cohort", type=Path, required=True)
     fetch.add_argument("--max-cache-age-hours", type=float, default=24)
@@ -4865,6 +7176,82 @@ def build_parser() -> argparse.ArgumentParser:
         "packetize", help="Create complete hierarchical semantic packets"
     )
     packetize.add_argument("--cohort", type=Path, required=True)
+
+    ambiguous_scan = subparsers.add_parser(
+        "scan-ambiguous",
+        help="Deterministically scan visible prose, citation titles, lead, and infobox",
+    )
+    ambiguous_scan.add_argument("--cohort", type=Path, required=True)
+
+    ambiguous_reuse = subparsers.add_parser(
+        "reuse-ambiguous-reviews",
+        help="Reuse unchanged non-ambiguous semantic decisions from completed reviews",
+    )
+    ambiguous_reuse.add_argument("--cohort", type=Path, required=True)
+    ambiguous_reuse.add_argument("--state", type=Path)
+    ambiguous_reuse.add_argument(
+        "--from-current-policy-cohort",
+        type=Path,
+        help="Reuse matching decisions from a cohort already reviewed under the current policy",
+    )
+
+    ambiguous_role_input = subparsers.add_parser(
+        "ambiguous-role-input",
+        help="Build one narrow semantic input for ambiguous-member evidence hits",
+    )
+    ambiguous_role_input.add_argument("--cohort", type=Path, required=True)
+    ambiguous_role_input.add_argument("--qid", required=True)
+    ambiguous_role_input.add_argument("--output", type=Path)
+
+    ambiguous_scheduler = subparsers.add_parser(
+        "ambiguous-scheduler-status",
+        help="Read-only refillable queue and tranche status for ambiguous members",
+    )
+    ambiguous_scheduler.add_argument("--cohort", type=Path, required=True)
+
+    ambiguous_claim = subparsers.add_parser(
+        "claim-ambiguous-assignment",
+        help="Claim one byte-capped ambiguous-member semantic assignment",
+    )
+    ambiguous_claim.add_argument("--cohort", type=Path, required=True)
+    ambiguous_claim.add_argument("--slot", type=int, required=True)
+
+    ambiguous_complete = subparsers.add_parser(
+        "complete-ambiguous-assignment",
+        help="Validate ambiguous-member semantic results and release the slot",
+    )
+    ambiguous_complete.add_argument("--cohort", type=Path, required=True)
+    ambiguous_complete.add_argument("--assignment-id", required=True)
+    ambiguous_complete.add_argument("--recorded-input-tokens", type=int)
+    ambiguous_complete.add_argument("--recorded-output-tokens", type=int)
+    ambiguous_completion = ambiguous_complete.add_mutually_exclusive_group(required=True)
+    ambiguous_completion.add_argument("--input", type=Path)
+    ambiguous_completion.add_argument("--failed-reason")
+
+    ambiguous_finalize = subparsers.add_parser(
+        "finalize-ambiguous-tranche",
+        help="Merge one reviewable tranche into the report-only manual-review CSV",
+    )
+    ambiguous_finalize.add_argument("--cohort", type=Path, required=True)
+    ambiguous_finalize.add_argument("--tranche", type=int, required=True)
+    ambiguous_finalize.add_argument(
+        "--review-csv", type=Path, default=AMBIGUOUS_REVIEW_CSV
+    )
+    ambiguous_finalize.add_argument("--state", type=Path)
+
+    for command, help_text in (
+        ("verify-ambiguous-repair", "Verify a staged targeted ambiguous-member repair"),
+        ("publish-ambiguous-repair", "Atomically publish a verified ambiguous-member repair"),
+    ):
+        repair = subparsers.add_parser(command, help=help_text)
+        repair.add_argument("--cohort", type=Path, required=True)
+        repair.add_argument("--manifest", type=Path, required=True)
+        repair.add_argument(
+            "--original-review-csv", type=Path, default=AMBIGUOUS_REVIEW_CSV
+        )
+        repair.add_argument("--original-state", type=Path)
+        repair.add_argument("--staged-review-csv", type=Path, required=True)
+        repair.add_argument("--staged-state", type=Path, required=True)
 
     init = subparsers.add_parser(
         "init-proposals", help="Create the strict proposal JSONL template"
@@ -5119,6 +7506,48 @@ def main(argv: Sequence[str] | None = None) -> int:
                 removed_csv=args.removed_csv,
             )
             print(run_dir)
+        elif args.command == "ambiguous-status":
+            print(
+                json.dumps(
+                    ambiguous_member_status(
+                        people_csv=args.people_csv,
+                        state_path=args.state
+                        or args.cache_root / "ambiguous-members-state.json",
+                        limit=args.limit,
+                        rescan_all=args.rescan_all,
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.command == "select-ambiguous":
+            print(
+                create_ambiguous_cohort(
+                    people_csv=args.people_csv,
+                    cache_root=args.cache_root,
+                    state_path=args.state
+                    or args.cache_root / "ambiguous-members-state.json",
+                    batch_size=args.batch_size,
+                    run_dir=args.run_dir,
+                    rescan_all=args.rescan_all,
+                    target_manifest=args.target_manifest,
+                    review_csv=args.review_csv,
+                )
+            )
+        elif args.command == "prepare-ambiguous-repair":
+            print(
+                json.dumps(
+                    prepare_ambiguous_repair_manifest(
+                        people_csv=args.people_csv,
+                        review_csv=args.review_csv,
+                        state_path=args.state
+                        or args.cache_root / "ambiguous-members-state.json",
+                        output=args.output,
+                        action=args.action,
+                        expected_count=args.expected_count,
+                    ),
+                    indent=2,
+                )
+            )
         elif args.command == "fetch":
             print(
                 json.dumps(
@@ -5139,6 +7568,90 @@ def main(argv: Sequence[str] | None = None) -> int:
                     indent=2,
                 )
             )
+        elif args.command == "scan-ambiguous":
+            print(
+                json.dumps(
+                    scan_ambiguous_members(
+                        cohort_value=args.cohort, cache_root=args.cache_root
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.command == "reuse-ambiguous-reviews":
+            print(
+                json.dumps(
+                    reuse_ambiguous_reviews(
+                        cohort_value=args.cohort,
+                        state_path=args.state
+                        or args.cache_root / "ambiguous-members-state.json",
+                        source_cohort=args.from_current_policy_cohort,
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.command == "ambiguous-role-input":
+            print(
+                build_ambiguous_role_input(
+                    cohort_value=args.cohort, qid=args.qid, output=args.output
+                )
+            )
+        elif args.command == "ambiguous-scheduler-status":
+            print(
+                json.dumps(
+                    ambiguous_scheduler_status(cohort_value=args.cohort), indent=2
+                )
+            )
+        elif args.command == "claim-ambiguous-assignment":
+            print(
+                json.dumps(
+                    claim_ambiguous_assignment(
+                        cohort_value=args.cohort, slot=args.slot
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.command == "complete-ambiguous-assignment":
+            print(
+                json.dumps(
+                    complete_ambiguous_assignment(
+                        cohort_value=args.cohort,
+                        assignment_id=args.assignment_id,
+                        input_path=args.input,
+                        failed_reason=args.failed_reason or "",
+                        recorded_input_tokens=args.recorded_input_tokens,
+                        recorded_output_tokens=args.recorded_output_tokens,
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.command == "finalize-ambiguous-tranche":
+            print(
+                json.dumps(
+                    finalize_ambiguous_tranche(
+                        cohort_value=args.cohort,
+                        tranche=args.tranche,
+                        review_csv=args.review_csv,
+                        state_path=args.state,
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.command in {"verify-ambiguous-repair", "publish-ambiguous-repair"}:
+            repair_kwargs = {
+                "cohort_value": args.cohort,
+                "manifest_path": args.manifest,
+                "original_review_csv": args.original_review_csv,
+                "original_state_path": args.original_state
+                or args.cache_root / "ambiguous-members-state.json",
+                "staged_review_csv": args.staged_review_csv,
+                "staged_state_path": args.staged_state,
+            }
+            result = (
+                publish_ambiguous_repair(**repair_kwargs)
+                if args.command == "publish-ambiguous-repair"
+                else verify_ambiguous_repair(**repair_kwargs)
+            )
+            print(json.dumps(result, indent=2))
         elif args.command == "fetch-alternates":
             print(
                 json.dumps(

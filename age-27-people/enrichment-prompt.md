@@ -16,10 +16,20 @@ mutually exclusive with it.
 - The controller owns selection, retrieval, packets, assignment packing and
   leases, artifact installation, retries, exceptions, article selection,
   vocabulary, assembly, public writes, browser data, and verification.
-- Exactly three semantic assignments may be leased concurrently. Each fresh
-  Luna/medium agent performs one manifest's homogeneous role and then exits.
+- The orchestrating Codex may keep up to six semantic assignments leased to six
+  fresh Luna/medium subagents concurrently. Each subagent performs one
+  manifest's homogeneous role and then exits.
   It receives no network/tools and writes one JSON array containing exactly one
   result per manifest item, in order.
+
+The independent ambiguous-member review lane is also in scope. It covers every
+live `possible` member plus every live member with multiple Wikidata birth or
+death dates, regardless of main-lane terminal or tranche state. Follow the
+canonical orchestrator prompt's `ambiguous-status`, `select-ambiguous`,
+`fetch`, `packetize`, `scan-ambiguous`, refillable ambiguous assignment, and
+`finalize-ambiguous-tranche` sequence. It is report-only and writes only the
+cumulative ambiguous-member review report and ignored run/state artifacts.
+Its semantic leases share the same global six-slot limit with this workflow.
 
 ## Queue initialization
 
